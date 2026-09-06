@@ -1,0 +1,14 @@
+node_modules/
+*.log
+npm-debug.log*
+.DS_Store
+.env
+.env.*
+!.env.example
+
+# локальное состояние плагина
+.zcode-plugin-state/
+*.local.json
+
+# артефакт, который ZCode создаёт в рабочей директории
+.mimosa/
