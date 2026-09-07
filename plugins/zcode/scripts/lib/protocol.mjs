@@ -770,7 +770,25 @@ export class ZCodeProtocolClient {
     const handler = this.requestHandlers.get(message.method);
     let payload;
     if (!handler) {
-      this._logDiag(`unhandled server request "${safeMethodForLog(message.method)}"; replying with {}`);
+      // No caller registered a handler for this server-initiated request.
+      // Replying with `{}` is still the right move *here* — the alternative
+      // is hanging the whole turn — but it must never be mistaken for a safe
+      // no-op: most real methods validate their reply against a schema with
+      // required fields (e.g. `interaction/requestPermission` requires a
+      // `decision` enum), so an empty object fails validation and is treated
+      // as an implicit denial/no-op while the turn itself keeps reporting
+      // success. That silent mismatch — success on the wire, nothing actually
+      // granted — is exactly how the ZCode `/code` write-permission defect
+      // reached production with 149 green tests and no failing assertion
+      // anywhere. Logged loudly, as a warning naming the method, specifically
+      // so the next unhandled `interaction/*` (or any other) request does not
+      // repeat it unnoticed — see lib/session.mjs's `runTurn` for the two
+      // methods that now get real handlers instead of falling through here.
+      this._logDiag(
+        `WARNING: unhandled server request "${safeMethodForLog(message.method)}" — no onRequest() handler ` +
+          "registered; replying with {} so the turn does not hang, but this may silently deny or no-op " +
+          "the request instead of answering it correctly.",
+      );
       payload = { id: message.id, result: {} };
     } else {
       try {

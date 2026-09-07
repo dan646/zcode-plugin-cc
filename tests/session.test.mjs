@@ -12,7 +12,12 @@ import { describe, test } from "node:test";
 
 import { ZCodeProtocolClient } from "../plugins/zcode/scripts/lib/protocol.mjs";
 import { workspaceRef } from "../plugins/zcode/scripts/lib/locate.mjs";
-import { runTurn, readWorkspaceState, isProviderConfigured } from "../plugins/zcode/scripts/lib/session.mjs";
+import {
+  runTurn,
+  readWorkspaceState,
+  isProviderConfigured,
+  DEFAULT_PERMISSION_POLICY,
+} from "../plugins/zcode/scripts/lib/session.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_PATH = path.join(__dirname, "fake-app-server.mjs");
@@ -424,5 +429,99 @@ describe("runTurn — cancellation", () => {
     } finally {
       callSpy.restore();
     }
+  });
+});
+
+// --- Regression coverage for the `/zcode:code` write-permission defect -----
+//
+// The bug: ZCode asks permission through a server-initiated
+// `interaction/requestPermission` request; nothing answered it with a
+// schema-valid reply, so the transport's generic `{}` fallback (a validation
+// failure from ZCode's point of view) was silently treated as a denial —
+// while the turn itself still reported `resultType: "success"`. These tests
+// drive the fixture's "permission" scenario (see fake-app-server.mjs), which
+// echoes the client's actual reply back on
+// `turn.completed.payload.debugInteractionReply`, so the assertions below are
+// checking the real reply `runTurn` sent over the wire, not a mock.
+describe("runTurn — permissionPolicy (interaction/requestPermission)", () => {
+  test("defaults to \"deny\" when the caller does not pass permissionPolicy", async () => {
+    assert.equal(DEFAULT_PERMISSION_POLICY, "deny");
+
+    const result = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("permission"),
+      prompt: "please write a file",
+    });
+
+    const completed = result.events.find((e) => e.type === "turn.completed");
+    assert.deepEqual(completed.params.payload.debugInteractionReply.result, {
+      decision: "deny",
+      reason: 'Denied by zcode-companion (runTurn permissionPolicy: "deny", the library default).',
+    });
+    assert.equal(result.response, "could not write the file");
+  });
+
+  test("permissionPolicy: \"allow\" answers interaction/requestPermission with decision: \"allow\"", async () => {
+    const result = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("permission"),
+      prompt: "please write a file",
+      permissionPolicy: "allow",
+    });
+
+    const completed = result.events.find((e) => e.type === "turn.completed");
+    assert.deepEqual(completed.params.payload.debugInteractionReply.result, {
+      decision: "allow",
+      reason: 'Approved by zcode-companion (runTurn permissionPolicy: "allow").',
+    });
+    assert.equal(result.response, "wrote the file");
+  });
+
+  test("permissionPolicy: \"deny\" answers interaction/requestPermission with decision: \"deny\"", async () => {
+    const result = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("permission"),
+      prompt: "please write a file",
+      permissionPolicy: "deny",
+    });
+
+    const completed = result.events.find((e) => e.type === "turn.completed");
+    assert.equal(completed.params.payload.debugInteractionReply.result.decision, "deny");
+  });
+
+  test("an invalid permissionPolicy is rejected before any call is made", async () => {
+    const callSpy = spyOnCalls();
+    try {
+      await assert.rejects(
+        () =>
+          runTurn({
+            cli: FIXTURE_CLI,
+            workspace: scenarioWorkspace("permission"),
+            prompt: "hi",
+            permissionPolicy: "escalate",
+          }),
+        /invalid permissionPolicy/,
+      );
+      assert.equal(callSpy.calls.length, 0, "no protocol call should happen once permissionPolicy fails validation");
+    } finally {
+      callSpy.restore();
+    }
+  });
+});
+
+describe("runTurn — interaction/requestUserInput (headless, no human to answer)", () => {
+  test("answers with a schema-valid decline instead of falling through to the transport's {} default", async () => {
+    const result = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("user-input"),
+      prompt: "ask the user something",
+    });
+
+    const completed = result.events.find((e) => e.type === "turn.completed");
+    const reply = completed.params.payload.debugInteractionReply.result;
+    assert.equal(reply.action, "decline");
+    assert.equal(typeof reply.reason, "string");
+    assert.ok(reply.reason.length > 0);
+    assert.equal(result.response, "handled without a human");
   });
 });

@@ -446,6 +446,15 @@ async function handleCode(argv, deps, log, logError) {
       model,
       timeoutMs,
       onProgress: makeOnProgress(logError),
+      // `runTurn`'s own default is "deny" (see lib/session.mjs) — a library
+      // must not silently grant permissions. This call site opts into
+      // "allow" deliberately: `code` exists to delegate actual file edits,
+      // so denying every `interaction/requestPermission` would make the
+      // command read-only and its whole purpose moot (this is precisely the
+      // defect this fix closes — see the module doc comment above). The
+      // owner accepted this because `code` always runs inside a git
+      // repository, where any write it makes can be reviewed and reverted.
+      permissionPolicy: "allow",
     });
   } catch (err) {
     throw isRunTurnTimeout(err) ? toActionableTimeoutError(err, timeoutMs) : err;
@@ -483,6 +492,12 @@ async function handleReview(argv, deps, log, logError) {
       model,
       timeoutMs,
       onProgress: makeOnProgress(logError),
+      // Same reasoning as `handleCode` above: `runTurn`'s default is "deny",
+      // and `review` opts into "allow" too. A review needs to actually use
+      // its tools to read the surrounding files a diff touches — denying
+      // every permission request breaks that the same way, and just as
+      // silently (resultType stays "success" while every read is refused).
+      permissionPolicy: "allow",
     });
   } catch (err) {
     throw isRunTurnTimeout(err) ? toActionableTimeoutError(err, timeoutMs) : err;

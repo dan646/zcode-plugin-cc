@@ -180,6 +180,23 @@ describe("ZCodeProtocolClient", () => {
     assert.deepEqual(result.clientReplied.result, {});
   });
 
+  test("an unhandled interaction/* request still gets {} (not a hang), but is logged as a loud warning naming the method", async () => {
+    const logger = makeLogger();
+    const client = spawnFakeClient({ logger });
+    const result = await client.call("test/unknownInteractionRequest", {});
+
+    // The turn is never left hanging — this is still the transport's own
+    // fallback, unchanged in shape from the generic case above.
+    assert.deepEqual(result.clientReplied.result, {});
+
+    // But unlike a routine diagnostic, this must be unmissable: it names the
+    // real method and says outright that the reply may be silently wrong.
+    const joined = logger.lines.join("\n");
+    assert.match(joined, /WARNING/);
+    assert.match(joined, /interaction\/browserList/);
+    assert.match(joined, /silently deny|silently wrong|no-op/i);
+  });
+
   test("onRequest() lets the caller override the default handler", async () => {
     const client = spawnFakeClient();
     client.onRequest("session/requestRuntimePreferences", () => ({ nativeSearchEnhancementsEnabled: true }));

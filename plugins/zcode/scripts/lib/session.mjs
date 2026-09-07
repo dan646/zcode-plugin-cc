@@ -52,6 +52,22 @@ import { ZCodeProtocolClient } from "./protocol.mjs";
 export const DEFAULT_TURN_TIMEOUT_MS = 180_000;
 
 /**
+ * Valid values for `runTurn`'s `permissionPolicy` option (see below).
+ */
+export const PERMISSION_POLICIES = Object.freeze(["allow", "deny"]);
+
+/**
+ * `runTurn`'s default `permissionPolicy`. Deliberately the *restrictive*
+ * choice: a library that answers `interaction/requestPermission` with
+ * `{decision:"allow"}` unless a caller opts out would be silently granting
+ * write/tool access to whatever prompt happens to be running. Only a caller
+ * that has actually weighed the tradeoff (see `zcode-companion.mjs`'s
+ * `handleCode`/`handleReview`, which both pass `"allow"` deliberately) should
+ * get that behavior.
+ */
+export const DEFAULT_PERMISSION_POLICY = "deny";
+
+/**
  * How long to keep waiting for a terminal event after `session/stop` has
  * been called on cancellation, before giving up and returning
  * `resultType: "cancelled"` anyway. The server is not guaranteed to ever
@@ -224,6 +240,79 @@ async function fetchSessionUsage(client, sessionId) {
 }
 
 /**
+ * Build the client-side handler for the server-initiated
+ * `interaction/requestPermission` request — the actual defect this file
+ * fixes. ZCode asks permission through this two-way request whenever a tool
+ * call (a file write, a shell command, ...) needs sign-off; the *transport*
+ * (`protocol.mjs`) has no handler registered for it by default, so an
+ * unanswered turn used to get the transport's generic `{}` fallback — which
+ * fails this method's own response schema (`decision` is a required enum)
+ * and is treated by ZCode as an implicit denial. The turn still reports
+ * `resultType: "success"` and exit code 0, because from ZCode's point of view
+ * nothing went wrong — it asked, was told (in effect) no, and moved on. That
+ * is how `/zcode:code` ran read-only while looking like it succeeded.
+ *
+ * Policy lives here, in the turn-lifecycle layer, deliberately NOT in
+ * `protocol.mjs` — the transport must stay free of opinions about what to
+ * grant. See `PERMISSION_POLICIES`/`DEFAULT_PERMISSION_POLICY` above for the
+ * default, and `zcode-companion.mjs`'s `handleCode`/`handleReview` for the
+ * one caller that currently opts into `"allow"`.
+ * @param {"allow" | "deny"} policy
+ * @returns {(params: any, message: any) => { decision: "allow" | "deny", reason: string }}
+ */
+function makeRequestPermissionHandler(policy) {
+  if (policy === "allow") {
+    return () => ({
+      decision: "allow",
+      reason: 'Approved by zcode-companion (runTurn permissionPolicy: "allow").',
+    });
+  }
+  return () => ({
+    decision: "deny",
+    reason: 'Denied by zcode-companion (runTurn permissionPolicy: "deny", the library default).',
+  });
+}
+
+/**
+ * Client-side handler for the server-initiated `interaction/requestUserInput`
+ * request (the family `interaction/requestPermission` belongs to — see
+ * docs/zcode-protocol-recon.md's two-way request section). `runTurn()` has no
+ * human on the other end, ever — this is a headless, one-shot turn — so there
+ * is nobody who could ever answer a prompt for free-text input or a
+ * multiple-choice question.
+ *
+ * The reply shape (`{action: "accept"|"decline"|"cancel", content?, reason?}`)
+ * was recovered from `/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs`
+ * (search for `interactionRequestUserInput` and the zod schema it validates
+ * replies against, referred to there as `Fje`:
+ * `f.object({action:f.enum(["accept","decline","cancel"]),content:Wu.optional(),reason:f.string().optional()}).strict()`,
+ * with `Wu = f.record(f.string(), f.unknown())`). This mirrors the MCP
+ * elicitation protocol's own `accept`/`decline`/`cancel` vocabulary, where
+ * `"decline"` means "the requester was reached and explicitly said no" (as
+ * opposed to `"cancel"`, "the request was abandoned/dismissed without an
+ * answer either way"). `"decline"` is the closer fit for "no interactive
+ * input will ever arrive this turn" — it lets ZCode's own flow react to an
+ * explicit no (e.g. fall back to a default, or fail that one tool call)
+ * rather than treating the whole interaction as aborted.
+ *
+ * What is NOT independently confirmed: how differently ZCode's *tool-calling*
+ * loop (as opposed to the elicitation plumbing this schema was lifted from)
+ * actually branches on `"decline"` vs `"cancel"` for every possible caller of
+ * `interaction/requestUserInput` (e.g. `askUserQuestion` vs a plan-approval
+ * prompt vs others) — only that a schema-valid, semantically-reasonable reply
+ * is sent instead of the schema-invalid `{}` this bug report is about. If a
+ * future live run shows `"decline"` stalls or mishandles some particular
+ * question shape, that is the next thing to reconcile against the bundle.
+ * @returns {{ action: "decline", reason: string }}
+ */
+function requestUserInputHandler() {
+  return {
+    action: "decline",
+    reason: "zcode-companion runs unattended: no interactive input is available for this turn.",
+  };
+}
+
+/**
  * Run one ZCode turn end to end: preflight -> session/create -> subscribe ->
  * (optional setModel/setMode) -> send -> wait for a terminal event -> close.
  *
@@ -243,6 +332,7 @@ async function fetchSessionUsage(client, sessionId) {
  *   onProgress?: (event: any) => void,
  *   timeoutMs?: number,
  *   cancelGraceMs?: number,
+ *   permissionPolicy?: "allow" | "deny",
  *   clientOptions?: import("./protocol.mjs").ZCodeProtocolClientOptions,
  * }} args
  * @returns {Promise<RunTurnResult>}
@@ -257,9 +347,26 @@ export async function runTurn({
   onProgress,
   timeoutMs = DEFAULT_TURN_TIMEOUT_MS,
   cancelGraceMs = DEFAULT_CANCEL_GRACE_MS,
+  permissionPolicy = DEFAULT_PERMISSION_POLICY,
   clientOptions = {},
 }) {
+  if (!PERMISSION_POLICIES.includes(permissionPolicy)) {
+    throw new Error(
+      `runTurn: invalid permissionPolicy ${JSON.stringify(permissionPolicy)} — ` +
+        `must be one of ${JSON.stringify(PERMISSION_POLICIES)}.`,
+    );
+  }
+
   const client = new ZCodeProtocolClient(cli, clientOptions);
+
+  // Answer the two server-initiated requests a headless turn is guaranteed to
+  // have no human for. Registered before `start()` so there is no window
+  // where `interaction/requestPermission` could fall through to
+  // `protocol.mjs`'s generic, schema-invalid `{}` default (see
+  // `makeRequestPermissionHandler`'s doc comment for why that default is the
+  // actual defect this closes).
+  client.onRequest("interaction/requestPermission", makeRequestPermissionHandler(permissionPolicy));
+  client.onRequest("interaction/requestUserInput", requestUserInputHandler);
 
   /** @type {Array<{ type: string, params: any }>} */
   const events = [];

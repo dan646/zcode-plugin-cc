@@ -492,6 +492,20 @@ describe("runCli — code / review success and failure paths (runTurn stubbed)",
     assert.deepEqual(capturedCall.model, { providerId: "zai", modelId: "glm-5.3-flash" });
   });
 
+  test("`code` passes permissionPolicy: \"allow\" to runTurn (writes are the whole point of the command)", async () => {
+    const sinks = makeSinks();
+    let capturedCall = null;
+    await runCli(["code", "add", "a", "health", "check"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        capturedCall = args;
+        return fakeTurnResult();
+      },
+    });
+    assert.equal(capturedCall.permissionPolicy, "allow");
+  });
+
   test("`code --model` overrides the default model", async () => {
     const sinks = makeSinks();
     let capturedCall = null;
@@ -523,6 +537,9 @@ describe("runCli — code / review success and failure paths (runTurn stubbed)",
     assert.match(sinks.stdout(), /Verdict: approve/);
     assert.deepEqual(capturedCall.model, { providerId: "zai", modelId: "glm-5.3" });
     assert.match(capturedCall.prompt, /working tree vs HEAD/);
+    // review needs its tools (reading the files a diff touches) to work at
+    // all — same reasoning as `code`, see handleReview's comment.
+    assert.equal(capturedCall.permissionPolicy, "allow");
   });
 
   test("a turn.failed error (surfaced by runTurn) maps to EXIT_TURN_FAILED with code/message/retryable", async () => {

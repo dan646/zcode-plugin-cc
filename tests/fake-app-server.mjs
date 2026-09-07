@@ -65,7 +65,9 @@ let nextServerRequestId = 1;
 // from this extension.
 //
 // Recognized scenarios: success, failure, no-providers, timeout, stop,
-// usage-fail (see scheduleTurnEvents and the session/usage case below).
+// usage-fail, permission, user-input (see scheduleTurnEvents, the
+// `session/send` case's own `interaction/*` branches, and the session/usage
+// case below).
 /**
  * @param {any} workspace
  * @returns {string | null}
@@ -440,6 +442,24 @@ rl.on("line", (line) => {
       break;
     }
 
+    // Same shape as "test/unhandledServerRequest" above, but with a real
+    // `interaction/*` method name that neither the client's built-in
+    // defaults nor `session.mjs`'s `runTurn` register a handler for (unlike
+    // `interaction/requestPermission`/`interaction/requestUserInput`, which
+    // now do). Exercises the "an unknown interaction/* request still gets a
+    // reply, logged as a loud warning naming the method" requirement without
+    // needing a real ZCode-specific method this fixture would have to keep
+    // in sync forever.
+    case "test/unknownInteractionRequest": {
+      const requestId = `srv${nextServerRequestId++}`;
+      send({ id: requestId, method: "interaction/browserList", params: {} });
+      pendingServerRequests.set(requestId, (reply) => {
+        assertValidReplyEnvelope(reply);
+        send({ id, result: { clientReplied: reply } });
+      });
+      break;
+    }
+
     case "test/notify": {
       // Noisy channel: must be filtered from `on()` delivery by default.
       send({ method: "process/mcpTelemetry", params: { noisy: true } });
@@ -613,7 +633,72 @@ rl.on("line", (line) => {
       sendServerRequest("session/requestRuntimePreferences", { scope: "user-execution" }, () => {
         if (scenario) scopesSeenBySession.get(sessionId)?.push("user-execution");
         send({ id, result: { accepted: true, sessionId: sessionId ?? "fake-session-1", stateRevision: 1 } });
-        if (scenario) {
+
+        // "permission" / "user-input" model the actual defect this project
+        // is fixing: a real tool call blocked on a two-way
+        // `interaction/requestPermission` (or `interaction/requestUserInput`)
+        // request mid-turn. The client's reply is echoed back on
+        // `turn.completed.payload.debugInteractionReply` so tests can assert
+        // on exactly what `session.mjs`'s handler answered, the same way
+        // `debugScopesSeen` lets other scenarios assert on the
+        // requestRuntimePreferences round trips.
+        if (scenario === "permission") {
+          sendServerRequest(
+            "interaction/requestPermission",
+            { toolName: "write_file", reason: "test scenario: write a file", riskLevel: "medium" },
+            (reply) => {
+              emitEvent(sessionId, "turn.completed", {
+                response: reply.result?.decision === "allow" ? "wrote the file" : "could not write the file",
+                usage: {
+                  source: "provider",
+                  modelRequestCount: 1,
+                  inputTokens: 10,
+                  outputTokens: 5,
+                  totalTokens: 15,
+                  cacheReadTokens: 0,
+                  cacheWriteTokens: 0,
+                  reasoningTokens: 0,
+                  webFetchRequests: 0,
+                  webSearchRequests: 0,
+                },
+                toolCallCount: 1,
+                historyRoundCount: 1,
+                duration: 10,
+                resultType: "completed",
+                cacheStats: {},
+                debugInteractionReply: reply,
+              });
+            },
+          );
+        } else if (scenario === "user-input") {
+          sendServerRequest(
+            "interaction/requestUserInput",
+            { requestId: "req1", prompt: "Pick one", questions: [] },
+            (reply) => {
+              emitEvent(sessionId, "turn.completed", {
+                response: "handled without a human",
+                usage: {
+                  source: "provider",
+                  modelRequestCount: 1,
+                  inputTokens: 10,
+                  outputTokens: 5,
+                  totalTokens: 15,
+                  cacheReadTokens: 0,
+                  cacheWriteTokens: 0,
+                  reasoningTokens: 0,
+                  webFetchRequests: 0,
+                  webSearchRequests: 0,
+                },
+                toolCallCount: 1,
+                historyRoundCount: 1,
+                duration: 10,
+                resultType: "completed",
+                cacheStats: {},
+                debugInteractionReply: reply,
+              });
+            },
+          );
+        } else if (scenario) {
           scheduleTurnEvents(sessionId, scenario, () => scopesSeenBySession.get(sessionId) ?? []);
         }
       });

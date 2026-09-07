@@ -10,9 +10,19 @@
 // shapes are asserted here explicitly. A green `node --test` does NOT imply a
 // working plugin; this probe is the only real evidence.
 //
+// It also could not have caught the `/zcode:code` write-permission defect on
+// its own before the section below was added: every earlier check here
+// inspects `resultType`/response text, never the filesystem — and the whole
+// point of that defect was that `resultType` stayed "success" while every
+// real write was silently denied. See the "write-permission regression"
+// section near the bottom.
+//
 // Requires a configured ZCode CLI: run `zcode login` once. Reads no secrets.
 
 import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { resolveZcodeCli, workspaceRef } from "../plugins/zcode/scripts/lib/locate.mjs";
 import { ZCodeProtocolClient } from "../plugins/zcode/scripts/lib/protocol.mjs";
 import { runTurn } from "../plugins/zcode/scripts/lib/session.mjs";
@@ -158,6 +168,73 @@ if (turn) {
       `model.streaming progress looks empty — payload not parsed: ${JSON.stringify(ev)}`);
   });
 }
+
+// ------------------------------------------------ write-permission regression
+//
+// This is the actual defect: ZCode blocks a real tool call (a file write) on
+// a server-initiated `interaction/requestPermission` request. Nothing here
+// trusts `resultType` or the response text — both stayed "success"-shaped
+// even while the write was silently denied, which is exactly how 149 green
+// unit tests missed this. The only thing that counts is whether the marker
+// file actually exists on disk afterward, with the content ZCode was asked
+// to write.
+//
+// Kept to one tiny file per run so this stays cheap: a fresh temp workspace,
+// one short prompt, one short file.
+
+console.log("\n— регрессия: право на запись файла (interaction/requestPermission) —");
+
+const MARKER_NAME = "zcode-write-probe-marker.txt";
+const MARKER_CONTENT = "ZCODE_WRITE_PROBE_OK";
+
+/**
+ * Run one `runTurn()` in a fresh throwaway workspace, asking ZCode to write a
+ * small marker file, then report what (if anything) actually landed on disk.
+ * Never throws: a denied permission can just as easily surface as a thrown
+ * turn error as a clean "I couldn't do that" response, depending on how
+ * ZCode's own agent loop reacts to the denial — either way, the filesystem is
+ * the only thing this probe trusts.
+ * @param {"allow" | "deny"} permissionPolicy
+ * @returns {Promise<string | null>} the file's content, or null if it does not exist
+ */
+async function runWritePermissionProbe(permissionPolicy) {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-write-probe-"));
+  const markerPath = path.join(dir, MARKER_NAME);
+  try {
+    await runTurn({
+      cli,
+      workspace: workspaceRef(dir),
+      prompt:
+        `Create a file named exactly "${MARKER_NAME}" in the current working directory. ` +
+        `Its entire contents must be exactly this one line, with no extra text, quotes, code ` +
+        `fences, or explanation: ${MARKER_CONTENT}\n` +
+        "Use your file-write tool directly, right away — do not ask any clarifying question.",
+      timeoutMs: 120_000,
+      permissionPolicy,
+    });
+  } catch {
+    // Ignored on purpose — see doc comment above.
+  }
+  let written = null;
+  try {
+    written = fs.readFileSync(markerPath, "utf8");
+  } catch {
+    written = null;
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+  return written;
+}
+
+const allowedContent = await runWritePermissionProbe("allow");
+check("permissionPolicy: \"allow\" — файл реально появился на диске с ожидаемым содержимым", () => {
+  assert.ok(allowedContent !== null, `marker file was never created (got ${JSON.stringify(allowedContent)})`);
+  assert.equal(allowedContent.trim(), MARKER_CONTENT);
+});
+
+const deniedContent = await runWritePermissionProbe("deny");
+check("permissionPolicy: \"deny\" — файл НЕ должен появиться на диске", () => {
+  assert.equal(deniedContent, null, `marker file should not exist, but found content: ${JSON.stringify(deniedContent)}`);
+});
 
 console.log(failures === 0 ? "\nРЕЗУЛЬТАТ: УСПЕХ" : `\nРЕЗУЛЬТАТ: ПРОВАЛ (${failures})`);
 process.exit(failures === 0 ? 0 : 1);
