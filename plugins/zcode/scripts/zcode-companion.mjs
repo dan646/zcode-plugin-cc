@@ -28,7 +28,7 @@ import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { buildReviewDiff } from "./lib/diff.mjs";
 import { resolveZcodeCli, workspaceRef } from "./lib/locate.mjs";
-import { runTurn, readWorkspaceState, isProviderConfigured } from "./lib/session.mjs";
+import { runTurn, readWorkspaceState, isProviderConfigured, formatDurationMs } from "./lib/session.mjs";
 import { redactSecrets, capDiagText } from "./lib/protocol.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -376,12 +376,83 @@ export function formatToolCallLine(event) {
 }
 
 /**
+ * Render a token count the way a human scans a status line — `210000` reads
+ * as noise, `210k` reads instantly. Used only by `formatHeartbeatLine` below;
+ * exact precision does not matter here (this is a liveness indicator, not an
+ * accounting figure — `renderTurnFooter`'s `formatUsage` still prints the
+ * precise numbers for that).
+ * @param {number} n
+ * @returns {string}
+ */
+function formatTokenCount(n) {
+  if (typeof n !== "number" || !Number.isFinite(n)) return String(n);
+  const abs = Math.abs(n);
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (abs >= 1_000) return `${Math.round(n / 1000)}k`;
+  return String(n);
+}
+
+/**
+ * Render one stderr line for a `heartbeat` progress event (see
+ * `lib/session.mjs`'s `runTurn` / `createHeartbeatMonitor`) — the answer to
+ * "is it working or hung" during the long silent stretch a real turn spends
+ * before any text streams back (see this file's own `DEFAULT_CODE_TIMEOUT_SECONDS`
+ * comment for that timing). Three distinct shapes, matching the three things
+ * a heartbeat event can report:
+ *   - the probe itself failed (`alive: false`) — the server may be dying;
+ *     `runTurn` itself ends the turn once this repeats `deadProbeThreshold`
+ *     times, this line is what a human sees while that is still in doubt;
+ *   - the server answered but `modelRequestCount`/`totalTokens` have not
+ *     grown for a while (`stalled: true`) — reported distinctly from "dead"
+ *     on purpose: a long model "thinking" stretch is normal and the turn is
+ *     never aborted for it (see `DEFAULT_STALL_WARN_MS`'s doc comment);
+ *   - the server answered and is making measurable progress — the common
+ *     case, shown as request/token counts with a `(+delta)` since the last
+ *     probe when one is available.
+ * @param {any} event a `{type: "heartbeat", ...}` progress event from `runTurn`
+ * @returns {string | null}
+ */
+export function formatHeartbeatLine(event) {
+  if (!event || event.type !== "heartbeat") return null;
+  const elapsed = formatDurationMs(event.elapsedMs ?? 0);
+
+  if (!event.alive) {
+    return `[zcode] ${elapsed} · нет ответа от ZCode (зонд не отвечает, ${event.consecutiveFailedProbes} подряд) — жду`;
+  }
+
+  if (event.stalled) {
+    const stalledFor = formatDurationMs(event.sinceLastProgressMs ?? 0);
+    return `[zcode] ${elapsed} · жив · без прогресса ${stalledFor} — модель думает`;
+  }
+
+  const parts = [];
+  if (typeof event.modelRequestCount === "number") {
+    const delta =
+      typeof event.modelRequestCountDelta === "number" && event.modelRequestCountDelta > 0
+        ? ` (+${event.modelRequestCountDelta})`
+        : "";
+    parts.push(`запросов ${event.modelRequestCount}${delta}`);
+  }
+  if (typeof event.totalTokens === "number") {
+    const delta =
+      typeof event.totalTokensDelta === "number" && event.totalTokensDelta > 0
+        ? ` (+${formatTokenCount(event.totalTokensDelta)})`
+        : "";
+    parts.push(`токенов ${formatTokenCount(event.totalTokens)}${delta}`);
+  }
+
+  return `[zcode] ${elapsed} · жив${parts.length > 0 ? " · " + parts.join(" · ") : ""}`;
+}
+
+/**
  * Progress forwarder for `runTurn`'s `onProgress` — streams model text as it
- * arrives, announces state transitions, and (new) prints one line per tool
- * call, all to stderr so stdout stays exactly the final response (pipeable,
- * per the unit-4 spec). `--quiet` (see `handleCode`/`handleReview`) makes
- * this a no-op entirely — the final `renderTurnFooter` summary is unaffected,
- * since that is printed separately, after `runTurn` resolves.
+ * arrives, announces state transitions, prints one line per tool call, and
+ * (new) one compact line per `heartbeat` self-check event (see
+ * `formatHeartbeatLine` above) — all to stderr so stdout stays exactly the
+ * final response (pipeable, per the unit-4 spec). `--quiet` (see
+ * `handleCode`/`handleReview`) makes this a no-op entirely — the final
+ * `renderTurnFooter` summary is unaffected, since that is printed separately,
+ * after `runTurn` resolves.
  *
  * The streamed-text branch is now restricted to `text_delta`/`reasoning_delta`
  * — the model's own natural-language output — rather than forwarding every
@@ -406,6 +477,9 @@ function makeOnProgress(write, { quiet = false } = {}) {
       }
     } else if (event.type === "state.updated" && event.reason) {
       write(`\n[zcode] ${event.reason}\n`);
+    } else if (event.type === "heartbeat") {
+      const line = formatHeartbeatLine(event);
+      if (line) write(`\n${line}\n`);
     }
   };
 }

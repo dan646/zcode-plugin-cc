@@ -20,6 +20,7 @@ import {
   parseTimeoutFlag,
   parseModeFlag,
   formatToolCallLine,
+  formatHeartbeatLine,
   buildCodePrompt,
   buildReviewPrompt,
   ZCODE_MODES,
@@ -971,6 +972,109 @@ describe("runCli — code / review success and failure paths (runTurn stubbed)",
     assert.equal(code, EXIT_OK);
     assert.match(sinks.stderr(), /prompt_started/);
     assert.match(sinks.stderr(), /tool: Bash wc -l notes\.txt/);
+  });
+
+  // ---------------------------------------------------------------- heartbeat
+
+  describe("formatHeartbeatLine", () => {
+    test("returns null for a non-heartbeat event", () => {
+      assert.equal(formatHeartbeatLine({ type: "state.updated", reason: "prompt_started" }), null);
+      assert.equal(formatHeartbeatLine(null), null);
+    });
+
+    test("an alive, progressing probe renders elapsed time, request count, and token count with deltas", () => {
+      const line = formatHeartbeatLine({
+        type: "heartbeat",
+        elapsedMs: 12 * 60_000 + 30_000,
+        alive: true,
+        stalled: false,
+        modelRequestCount: 4,
+        modelRequestCountDelta: 1,
+        totalTokens: 210_000,
+        totalTokensDelta: 48_000,
+      });
+      assert.match(line, /12m30s/);
+      assert.match(line, /жив/);
+      assert.match(line, /запросов 4 \(\+1\)/);
+      assert.match(line, /токенов 210k \(\+48k\)/);
+    });
+
+    test("a stalled probe reports 'no progress' distinctly, without request/token counts", () => {
+      const line = formatHeartbeatLine({
+        type: "heartbeat",
+        elapsedMs: 18 * 60_000,
+        alive: true,
+        stalled: true,
+        sinceLastProgressMs: 5 * 60_000,
+        modelRequestCount: 4,
+        totalTokens: 210_000,
+      });
+      assert.match(line, /18m00s/);
+      assert.match(line, /жив/);
+      assert.match(line, /без прогресса/);
+      assert.match(line, /5m00s/);
+      assert.doesNotMatch(line, /запросов/);
+    });
+
+    test("a dead (not alive) probe reports failure distinctly from a stall", () => {
+      const line = formatHeartbeatLine({
+        type: "heartbeat",
+        elapsedMs: 60_000,
+        alive: false,
+        consecutiveFailedProbes: 2,
+      });
+      assert.match(line, /нет ответа/);
+      assert.match(line, /2/);
+      assert.doesNotMatch(line, /жив/);
+    });
+  });
+
+  test("`code --quiet` also suppresses heartbeat progress lines", async () => {
+    const sinks = makeSinks();
+    const code = await runCli(["code", "do", "something", "--quiet"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({
+          type: "heartbeat",
+          elapsedMs: 60_000,
+          alive: true,
+          stalled: false,
+          modelRequestCount: 4,
+          modelRequestCountDelta: 1,
+          totalTokens: 210_000,
+          totalTokensDelta: 48_000,
+        });
+        return fakeTurnResult();
+      },
+    });
+    assert.equal(code, EXIT_OK);
+    assert.doesNotMatch(sinks.stderr(), /жив/);
+    assert.doesNotMatch(sinks.stderr(), /запросов/);
+  });
+
+  test("without --quiet, a heartbeat progress event reaches stderr", async () => {
+    const sinks = makeSinks();
+    const code = await runCli(["code", "do", "something"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({
+          type: "heartbeat",
+          elapsedMs: 60_000,
+          alive: true,
+          stalled: false,
+          modelRequestCount: 4,
+          modelRequestCountDelta: 1,
+          totalTokens: 210_000,
+          totalTokensDelta: 48_000,
+        });
+        return fakeTurnResult();
+      },
+    });
+    assert.equal(code, EXIT_OK);
+    assert.match(sinks.stderr(), /жив/);
+    assert.match(sinks.stderr(), /запросов 4 \(\+1\)/);
   });
 
   test("a runTurn timeout error is enhanced with the wait time and a --timeout suggestion", async () => {

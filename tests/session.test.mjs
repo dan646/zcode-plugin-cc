@@ -572,6 +572,163 @@ describe("runTurn — permissionPolicy (interaction/requestPermission)", () => {
   });
 });
 
+// --- Heartbeat (active liveness self-check while waiting for a turn) -------
+//
+// See lib/session.mjs's `createHeartbeatMonitor` doc comment for the design:
+// during the long silent stretch of a real turn (first 10-15 minutes with no
+// streamed output at all), a caller cannot otherwise tell "still working"
+// from "the connection died". These scenarios (heartbeat-growth,
+// heartbeat-flaky, heartbeat-dead — see fake-app-server.mjs) never emit a
+// terminal event on their own, so each test drives the run to its own end
+// via a short `timeoutMs`, with small heartbeat thresholds so the whole
+// suite stays fast.
+describe("runTurn — heartbeat (active liveness self-check)", () => {
+  test("silence triggers a session/usage probe, reported as an alive heartbeat event", { timeout: 5000 }, async () => {
+    const progressEvents = [];
+    await assert.rejects(
+      runTurn({
+        cli: FIXTURE_CLI,
+        workspace: scenarioWorkspace("timeout"),
+        prompt: "hi",
+        timeoutMs: 200,
+        heartbeatIntervalMs: 30,
+        onProgress: (e) => progressEvents.push(e),
+      }),
+      /timed out after 200ms/,
+    );
+    const heartbeats = progressEvents.filter((e) => e.type === "heartbeat");
+    assert.ok(heartbeats.length > 0, `expected at least one heartbeat event, got ${JSON.stringify(heartbeats)}`);
+    assert.ok(heartbeats.every((e) => e.alive === true));
+    assert.ok(heartbeats.every((e) => typeof e.elapsedMs === "number" && e.elapsedMs >= 0));
+    assert.ok(heartbeats.every((e) => typeof e.sinceLastEventMs === "number" && e.sinceLastEventMs >= 0));
+  });
+
+  test("growing modelRequestCount/totalTokens across probes are reported as progress", { timeout: 5000 }, async () => {
+    const progressEvents = [];
+    await assert.rejects(
+      runTurn({
+        cli: FIXTURE_CLI,
+        workspace: scenarioWorkspace("heartbeat-growth"),
+        prompt: "hi",
+        timeoutMs: 250,
+        heartbeatIntervalMs: 30,
+        onProgress: (e) => progressEvents.push(e),
+      }),
+    );
+    const heartbeats = progressEvents.filter((e) => e.type === "heartbeat");
+    // The very first probe has nothing to compare against (`progressed`
+    // must be `null`, not `false`) — only probes after it can show growth.
+    const withComparison = heartbeats.filter((e) => e.progressed !== null);
+    assert.ok(withComparison.length > 0, `need at least one probe with a prior comparison: ${JSON.stringify(heartbeats)}`);
+    assert.ok(withComparison.every((e) => e.progressed === true));
+    assert.ok(withComparison.every((e) => e.stalled === false));
+    assert.ok(withComparison.every((e) => (e.modelRequestCountDelta ?? 0) > 0 || (e.totalTokensDelta ?? 0) > 0));
+  });
+
+  test("unchanged counters are reported as no progress, then stalled after stallWarnMs", { timeout: 5000 }, async () => {
+    const progressEvents = [];
+    await assert.rejects(
+      runTurn({
+        cli: FIXTURE_CLI,
+        workspace: scenarioWorkspace("timeout"),
+        prompt: "hi",
+        timeoutMs: 300,
+        heartbeatIntervalMs: 30,
+        stallWarnMs: 40,
+        onProgress: (e) => progressEvents.push(e),
+      }),
+    );
+    const heartbeats = progressEvents.filter((e) => e.type === "heartbeat");
+    const withComparison = heartbeats.filter((e) => e.progressed !== null);
+    assert.ok(withComparison.length > 0, "need at least one probe with a prior comparison");
+    assert.ok(withComparison.every((e) => e.progressed === false), "the fixture's default session/usage reply never changes");
+    assert.ok(heartbeats.some((e) => e.stalled === true), `expected a stalled heartbeat: ${JSON.stringify(heartbeats)}`);
+  });
+
+  test("three consecutive failed probes end the turn early, naming the reason", { timeout: 5000 }, async () => {
+    const start = Date.now();
+    await assert.rejects(
+      runTurn({
+        cli: FIXTURE_CLI,
+        workspace: scenarioWorkspace("heartbeat-dead"),
+        prompt: "hi",
+        // Deliberately large — the point is that the heartbeat ends the turn
+        // long before this would ever be reached.
+        timeoutMs: 5000,
+        heartbeatIntervalMs: 30,
+        heartbeatProbeTimeoutMs: 500,
+        deadProbeThreshold: 3,
+      }),
+      /stopped responding/,
+    );
+    assert.ok(
+      Date.now() - start < 2000,
+      "must end early on 3 consecutive dead probes, not wait out the full 5000ms timeoutMs",
+    );
+  });
+
+  test("one failed probe followed by a successful one does not end the turn (counter resets)", { timeout: 5000 }, async () => {
+    const progressEvents = [];
+    await assert.rejects(
+      runTurn({
+        cli: FIXTURE_CLI,
+        workspace: scenarioWorkspace("heartbeat-flaky"),
+        prompt: "hi",
+        timeoutMs: 250,
+        heartbeatIntervalMs: 30,
+        deadProbeThreshold: 3,
+        onProgress: (e) => progressEvents.push(e),
+      }),
+      // The ordinary timeout, NOT the "stopped responding" early-exit error —
+      // one blip must never be enough to end the turn.
+      /timed out after 250ms/,
+    );
+    const heartbeats = progressEvents.filter((e) => e.type === "heartbeat");
+    assert.ok(heartbeats.some((e) => e.alive === false), "the one failed probe must be reported");
+    assert.ok(
+      heartbeats.some((e) => e.alive === true && e.consecutiveFailedProbes === 0),
+      "a successful probe after a failure must reset the consecutive-failure counter",
+    );
+  });
+
+  test("heartbeatIntervalMs: 0 disables the mechanism entirely", { timeout: 5000 }, async () => {
+    const callSpy = spyOnCalls();
+    const progressEvents = [];
+    try {
+      await assert.rejects(
+        runTurn({
+          cli: FIXTURE_CLI,
+          workspace: scenarioWorkspace("timeout"),
+          prompt: "hi",
+          timeoutMs: 100,
+          heartbeatIntervalMs: 0,
+          onProgress: (e) => progressEvents.push(e),
+        }),
+      );
+      assert.ok(!progressEvents.some((e) => e.type === "heartbeat"));
+      // The only `session/usage` call allowed here is the mandatory,
+      // heartbeat-independent `fetchSessionUsage` attached to the thrown
+      // error (see lib/session.mjs's follow-up requirement 4) — never more
+      // than that one.
+      const usageCalls = callSpy.calls.filter((c) => c.method === "session/usage");
+      assert.ok(usageCalls.length <= 1, `expected no heartbeat-driven session/usage calls, got ${usageCalls.length}`);
+    } finally {
+      callSpy.restore();
+    }
+  });
+
+  test("the probe does not interfere with a normal turn reaching turn.completed", async () => {
+    const result = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("success"),
+      prompt: "hi",
+      heartbeatIntervalMs: 1,
+    });
+    assert.equal(result.resultType, "completed");
+    assert.equal(result.response, "Hello!");
+  });
+});
+
 describe("runTurn — interaction/requestUserInput (headless, no human to answer)", () => {
   test("answers with a schema-valid decline instead of falling through to the transport's {} default", async () => {
     const result = await runTurn({

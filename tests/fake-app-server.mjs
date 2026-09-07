@@ -67,7 +67,11 @@ let nextServerRequestId = 1;
 // Recognized scenarios: success, failure, no-providers, timeout, stop,
 // usage-fail, permission, user-input (see scheduleTurnEvents, the
 // `session/send` case's own `interaction/*` branches, and the session/usage
-// case below).
+// case below), plus four heartbeat-specific scenarios (see both places
+// below): heartbeat-growth, heartbeat-flaky, heartbeat-dead. Like "timeout",
+// all three never emit a terminal event on their own — the heartbeat tests in
+// tests/session.test.mjs control the run's end via `timeoutMs` instead, so
+// the fixture doesn't need to model a real completion for them.
 /**
  * @param {any} workspace
  * @returns {string | null}
@@ -83,6 +87,10 @@ function scenarioFromWorkspace(workspace) {
 const sessionScenarios = new Map();
 /** @type {Map<string, string[]>} sessionId -> ordered list of requestRuntimePreferences scopes answered */
 const scopesSeenBySession = new Map();
+/** @type {Map<string, number>} sessionId -> number of `session/usage` calls seen so far (1-based on
+ * first call) — used by the heartbeat scenarios (heartbeat-flaky, heartbeat-growth) below to vary
+ * their reply per call. */
+const usageCallCountBySession = new Map();
 let sessionCounter = 0;
 let eventSeqCounter = 0;
 
@@ -172,7 +180,15 @@ function emitStateUpdated(sessionId, { patch, reason, revision, scope }) {
  * @param {() => string[]} getScopesSeen
  */
 function scheduleTurnEvents(sessionId, scenario, getScopesSeen) {
-  if (scenario === "timeout") {
+  if (
+    scenario === "timeout" ||
+    scenario === "heartbeat-growth" ||
+    scenario === "heartbeat-flaky" ||
+    scenario === "heartbeat-dead"
+  ) {
+    // Never emit a terminal event — the heartbeat tests drive these purely
+    // through `runTurn`'s `timeoutMs`/liveness monitor, not a real
+    // completion (see the "Unit-3 turn-lifecycle scenarios" comment above).
     return;
   }
 
@@ -762,10 +778,70 @@ rl.on("line", (line) => {
       // fixture/reality drift already caught elsewhere in this file.
       const sessionId = params?.sessionId;
       const scenario = sessionScenarios.get(sessionId);
+      const callCount = (usageCallCountBySession.get(sessionId) ?? 0) + 1;
+      usageCallCountBySession.set(sessionId, callCount);
+
       if (scenario === "usage-fail") {
         send({ id, error: { code: -32000, message: "session/usage failed (test scenario)" } });
         break;
       }
+
+      // --- heartbeat-specific behaviors (see the scheduleTurnEvents note) ---
+      if (scenario === "heartbeat-dead") {
+        // Every probe fails — exercises the "N consecutive failed probes end
+        // the turn early" path (`deadProbeThreshold` in lib/session.mjs).
+        send({ id, error: { code: -32000, message: "session/usage unavailable (test scenario: heartbeat-dead)" } });
+        break;
+      }
+      if (scenario === "heartbeat-flaky") {
+        // The FIRST probe fails, every one after succeeds with fixed counts
+        // — exercises "one failed probe followed by a success resets the
+        // consecutive-failure counter (does not end the turn)".
+        if (callCount === 1) {
+          send({
+            id,
+            error: { code: -32000, message: "session/usage transient failure (test scenario: heartbeat-flaky)" },
+          });
+          break;
+        }
+        send({
+          id,
+          result: {
+            sessionId,
+            modelRequestCount: 2,
+            modelErrorCount: 0,
+            totalTokens: 1000,
+            inputTokens: 900,
+            outputTokens: 100,
+            reasoningTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            inputBaselineBySource: {},
+          },
+        });
+        break;
+      }
+      if (scenario === "heartbeat-growth") {
+        // modelRequestCount/totalTokens climb on every successful call —
+        // exercises "growing counters are reported as progress".
+        send({
+          id,
+          result: {
+            sessionId,
+            modelRequestCount: callCount,
+            modelErrorCount: 0,
+            totalTokens: callCount * 1000,
+            inputTokens: callCount * 900,
+            outputTokens: callCount * 100,
+            reasoningTokens: 0,
+            cacheReadTokens: 0,
+            cacheCreationTokens: 0,
+            inputBaselineBySource: {},
+          },
+        });
+        break;
+      }
+
       send({
         id,
         result: {

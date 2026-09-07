@@ -298,5 +298,56 @@ if (toolProgressLines.length > 0) {
   console.log(`  (пример) ${toolProgressLines[0]}`);
 }
 
+// --------------------------------------------------------- прогресс: heartbeat
+//
+// Self-check of turn liveness (see lib/session.mjs's `createHeartbeatMonitor`
+// doc comment): during the long silent stretch of a real turn there is no
+// other way to tell "still working" from "connection died" than an active
+// `session/usage` probe. Everything in tests/session.test.mjs exercises this
+// against the fixture; this is the only check that it actually fires against
+// a REAL app-server and gets back a real, alive probe result. A deliberately
+// tiny `heartbeatIntervalMs` (far below the library default of 30s) forces at
+// least one probe to happen even for a short "reply with PONG" turn.
+
+console.log("\n— прогресс: самопроверка живости хода (heartbeat / session/usage) —");
+
+async function runHeartbeatProbe() {
+  const heartbeats = [];
+  try {
+    await runTurn({
+      cli,
+      workspace: ws,
+      prompt: "Reply with exactly: PONG. Do not use any tools.",
+      timeoutMs: 60_000,
+      heartbeatIntervalMs: 300,
+      onProgress: (event) => {
+        if (event.type === "heartbeat") heartbeats.push(event);
+      },
+    });
+  } catch {
+    // Ignored on purpose — this probe only cares about the heartbeat stream,
+    // not whether the turn itself completed in time.
+  }
+  return heartbeats;
+}
+
+const heartbeatEvents = await runHeartbeatProbe();
+check("ход с малым heartbeatIntervalMs даёт хотя бы одно событие heartbeat", () => {
+  assert.ok(
+    heartbeatEvents.length > 0,
+    "no heartbeat progress events arrived at all — either the mechanism did not fire, or the turn " +
+      "completed before the first probe could run",
+  );
+});
+check("хотя бы одно событие heartbeat сообщает о живом сервере (alive: true)", () => {
+  assert.ok(
+    heartbeatEvents.some((e) => e.alive === true),
+    `no alive heartbeat among ${JSON.stringify(heartbeatEvents)}`,
+  );
+});
+if (heartbeatEvents.length > 0) {
+  console.log(`  (пример) elapsedMs=${heartbeatEvents[0].elapsedMs} alive=${heartbeatEvents[0].alive}`);
+}
+
 console.log(failures === 0 ? "\nРЕЗУЛЬТАТ: УСПЕХ" : `\nРЕЗУЛЬТАТ: ПРОВАЛ (${failures})`);
 process.exit(failures === 0 ? 0 : 1);

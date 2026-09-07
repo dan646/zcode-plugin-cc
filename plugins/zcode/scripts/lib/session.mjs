@@ -77,6 +77,229 @@ export const DEFAULT_PERMISSION_POLICY = "deny";
  */
 export const DEFAULT_CANCEL_GRACE_MS = 5_000;
 
+// --- Heartbeat (active liveness self-check while waiting for a turn) -------
+//
+// `zcode-companion.mjs`'s own defaults bumped the turn timeout to 2700s/1800s
+// (see its module doc comment) because real ZCode work takes 20-30 minutes
+// end to end, with the FIRST 10-15 minutes producing no streamed output at
+// all. During that stretch a caller cannot tell "still working" from "the
+// connection died silently" — and on a real disconnect, the old behavior was
+// to find out only once the full 45-minute timeout finally elapsed.
+//
+// A wall-clock timer proves nothing here ("it's been quiet for 10 minutes"
+// is exactly what a healthy turn looks like too) — the only trustworthy
+// signal is an ACTIVE probe: `session/usage` is a cheap round trip that both
+// (a) confirms the server is still answering at all, and (b) reports
+// `modelRequestCount`/`totalTokens`, which keep climbing while the model is
+// genuinely working even though nothing has streamed back yet. See
+// `createHeartbeatMonitor` below for the mechanism, and `runTurn`'s own doc
+// comment for how it plugs into the wait loop.
+
+/** Default `runTurn` `heartbeatIntervalMs` — how long the wait loop tolerates
+ * silence (no event of any kind) from the server before it actively probes
+ * with `session/usage`. Passing `0` disables the whole mechanism. */
+export const DEFAULT_HEARTBEAT_INTERVAL_MS = 30_000;
+
+/** Default `runTurn` `heartbeatProbeTimeoutMs` — the probe's OWN timeout,
+ * deliberately short and unrelated to the turn's overall `timeoutMs`: a
+ * probe that itself hangs for minutes would defeat the point of probing. */
+export const DEFAULT_HEARTBEAT_PROBE_TIMEOUT_MS = 5_000;
+
+/** Default `runTurn` `deadProbeThreshold` — consecutive failed/timed-out
+ * probes after which the turn is ended early with a clear error, rather than
+ * silently waiting out the rest of `timeoutMs` against a server that has
+ * already stopped answering. */
+export const DEFAULT_DEAD_PROBE_THRESHOLD = 3;
+
+/** Default `runTurn` `stallWarnMs` — how long a live server may go without
+ * `modelRequestCount`/`totalTokens` growing before a heartbeat event flags
+ * `stalled: true`. This is advisory only (see `createHeartbeatMonitor`) —
+ * long model "thinking" is normal and the turn is never aborted for it. */
+export const DEFAULT_STALL_WARN_MS = 5 * 60_000;
+
+/**
+ * Render a millisecond duration as `"<minutes>m<seconds>s"` (e.g. `12m30s`,
+ * `0m05s`) — the one duration format this module and `zcode-companion.mjs`'s
+ * heartbeat lines both use, so a user comparing the two never has to
+ * reconcile two different notations for the same kind of number.
+ * @param {number} ms
+ * @returns {string}
+ */
+export function formatDurationMs(ms) {
+  const totalSeconds = Math.max(0, Math.round(ms / 1000));
+  const minutes = Math.floor(totalSeconds / 60);
+  const seconds = totalSeconds % 60;
+  return `${minutes}m${String(seconds).padStart(2, "0")}s`;
+}
+
+/**
+ * Active liveness monitor for the "waiting on a terminal event" phase of a
+ * turn (see the module-level heartbeat design comment above, and `runTurn`'s
+ * own use of this below). Ticks on a fixed `heartbeatIntervalMs` cadence;
+ * each tick only actually probes when the server has been silent (no
+ * progress/terminal notification of any kind — see `getLastEventAt`) for at
+ * least that long, so an actively-streaming turn is never interrupted by
+ * probing at all.
+ *
+ * Every probe outcome is reported via `onProgress` as a `{type: "heartbeat"}`
+ * event (requirement 3 of the self-check spec) with enough fields for a
+ * caller to render "is it working or hung" in one line:
+ *   - `elapsedMs` / `sinceLastEventMs`: how long the turn has been waiting,
+ *     and how long since the last event of any kind.
+ *   - `alive`: whether THIS probe got a response at all.
+ *   - `progressed`: whether `modelRequestCount`/`totalTokens` grew versus
+ *     the PREVIOUS probe (`null` on the very first probe — there is nothing
+ *     to compare against yet).
+ *   - `stalled`: `true` only once a live server has gone `stallWarnMs`
+ *     without measured progress — deliberately advisory, never a reason to
+ *     abort (long model "thinking" is normal; see `DEFAULT_STALL_WARN_MS`).
+ *   - `consecutiveFailedProbes`: resets to 0 on the first successful probe
+ *     after any failures — a single blip must not count toward
+ *     `deadProbeThreshold`.
+ *
+ * When `consecutiveFailedProbes` reaches `deadProbeThreshold`, `deadPromise`
+ * resolves — `runTurn` races this alongside its timeout/terminal/abort
+ * promises so a genuinely dead connection ends the turn immediately instead
+ * of waiting out the rest of `timeoutMs` (requirement 4).
+ * @param {object} args
+ * @param {import("./protocol.mjs").ZCodeProtocolClient} args.client
+ * @param {string} args.sessionId
+ * @param {((event: any) => void) | undefined} args.onProgress
+ * @param {number} args.heartbeatIntervalMs
+ * @param {number} args.heartbeatProbeTimeoutMs
+ * @param {number} args.deadProbeThreshold
+ * @param {number} args.stallWarnMs
+ * @param {number} args.waitStartedAt epoch ms when the turn began waiting (right after `session/send`)
+ * @param {() => number} args.getLastEventAt reads the current "last event at" timestamp
+ * @returns {{ deadPromise: Promise<{ type: "dead", elapsedMs: number, consecutiveFailedProbes: number, probeError: string | null }>, stop: () => void }}
+ */
+function createHeartbeatMonitor({
+  client,
+  sessionId,
+  onProgress,
+  heartbeatIntervalMs,
+  heartbeatProbeTimeoutMs,
+  deadProbeThreshold,
+  stallWarnMs,
+  waitStartedAt,
+  getLastEventAt,
+}) {
+  let stopped = false;
+  /** @type {NodeJS.Timeout | null} */
+  let timer = null;
+  let consecutiveFailedProbes = 0;
+  /** @type {{ modelRequestCount: number | null, totalTokens: number | null } | null} */
+  let lastProbeCounts = null;
+  let lastProgressAt = waitStartedAt;
+  /** @type {(value: { elapsedMs: number, consecutiveFailedProbes: number, probeError: string | null }) => void} */
+  let resolveDead;
+  const deadOutcome = new Promise((resolve) => {
+    resolveDead = resolve;
+  });
+
+  function schedule() {
+    if (stopped) return;
+    timer = setTimeout(tick, heartbeatIntervalMs);
+    timer.unref?.();
+  }
+
+  async function tick() {
+    if (stopped) return;
+    const now = Date.now();
+    const sinceLastEventMs = now - getLastEventAt();
+    if (sinceLastEventMs < heartbeatIntervalMs) {
+      // The server has said SOMETHING recently enough — no need to probe.
+      schedule();
+      return;
+    }
+
+    let alive = false;
+    let probeError = null;
+    /** @type {{ modelRequestCount: number | null, totalTokens: number | null } | null} */
+    let counts = null;
+    try {
+      const usage = await client.call("session/usage", { sessionId }, { timeoutMs: heartbeatProbeTimeoutMs });
+      alive = true;
+      counts = {
+        modelRequestCount: typeof usage?.modelRequestCount === "number" ? usage.modelRequestCount : null,
+        totalTokens: typeof usage?.totalTokens === "number" ? usage.totalTokens : null,
+      };
+    } catch (err) {
+      probeError = err?.message ? String(err.message) : "unknown probe error";
+    }
+
+    // The main wait may have settled (terminal event, timeout, abort) while
+    // this probe was in flight — `stop()` already ran, so no further ticks
+    // or progress events should follow from this one.
+    if (stopped) return;
+
+    const afterProbeNow = Date.now();
+    let progressed = null;
+    let modelRequestCountDelta = null;
+    let totalTokensDelta = null;
+
+    if (alive) {
+      if (lastProbeCounts) {
+        if (typeof counts.modelRequestCount === "number" && typeof lastProbeCounts.modelRequestCount === "number") {
+          modelRequestCountDelta = counts.modelRequestCount - lastProbeCounts.modelRequestCount;
+        }
+        if (typeof counts.totalTokens === "number" && typeof lastProbeCounts.totalTokens === "number") {
+          totalTokensDelta = counts.totalTokens - lastProbeCounts.totalTokens;
+        }
+        progressed = (modelRequestCountDelta ?? 0) > 0 || (totalTokensDelta ?? 0) > 0;
+      }
+      // No previous probe to compare against (`progressed === null`) counts
+      // as fresh, not stale — the stall clock only starts once there is
+      // actually something to have gone stale against.
+      if (progressed !== false) {
+        lastProgressAt = afterProbeNow;
+      }
+      lastProbeCounts = counts;
+      consecutiveFailedProbes = 0;
+    } else {
+      consecutiveFailedProbes += 1;
+    }
+
+    const elapsedMs = afterProbeNow - waitStartedAt;
+    const sinceLastProgressMs = alive ? afterProbeNow - lastProgressAt : null;
+    const stalled = alive && sinceLastProgressMs !== null && sinceLastProgressMs >= stallWarnMs;
+
+    safeProgress(onProgress, {
+      type: "heartbeat",
+      elapsedMs,
+      sinceLastEventMs,
+      alive,
+      probeError,
+      consecutiveFailedProbes,
+      progressed,
+      stalled,
+      sinceLastProgressMs,
+      modelRequestCount: counts?.modelRequestCount ?? null,
+      totalTokens: counts?.totalTokens ?? null,
+      modelRequestCountDelta,
+      totalTokensDelta,
+    });
+
+    if (!alive && consecutiveFailedProbes >= deadProbeThreshold) {
+      stopped = true;
+      resolveDead({ elapsedMs, consecutiveFailedProbes, probeError });
+      return;
+    }
+
+    schedule();
+  }
+
+  schedule();
+
+  return {
+    deadPromise: deadOutcome.then((info) => ({ type: "dead", ...info })),
+    stop() {
+      stopped = true;
+      if (timer) clearTimeout(timer);
+    },
+  };
+}
+
 const TERMINAL_EVENT_TYPES = ["turn.completed", "turn.failed"];
 const PROGRESS_EVENT_TYPES = ["model.streaming", "state.updated"];
 
@@ -359,8 +582,35 @@ function requestUserInputHandler() {
  *   timeoutMs?: number,
  *   cancelGraceMs?: number,
  *   permissionPolicy?: "allow" | "deny",
+ *   heartbeatIntervalMs?: number,
+ *   heartbeatProbeTimeoutMs?: number,
+ *   deadProbeThreshold?: number,
+ *   stallWarnMs?: number,
  *   clientOptions?: import("./protocol.mjs").ZCodeProtocolClientOptions,
  * }} args
+ * @param {number} [args.heartbeatIntervalMs] How long the wait loop tolerates
+ *   silence (no event of any kind from the server) before actively probing
+ *   with `session/usage` — see the "Heartbeat" section above `runTurn` for
+ *   why a passive timer alone cannot tell "still working" from "hung".
+ *   Defaults to {@link DEFAULT_HEARTBEAT_INTERVAL_MS} (30s). Pass `0` to
+ *   disable the whole mechanism (no probes, no `heartbeat` progress events,
+ *   no early exit on a dead connection).
+ * @param {number} [args.heartbeatProbeTimeoutMs] The probe's own timeout —
+ *   short and independent of `timeoutMs` (a hung probe must not itself wait
+ *   minutes). Defaults to {@link DEFAULT_HEARTBEAT_PROBE_TIMEOUT_MS} (5s).
+ * @param {number} [args.deadProbeThreshold] Consecutive failed/timed-out
+ *   probes after which the turn is ended early with a clear error instead of
+ *   silently waiting out the rest of `timeoutMs` against a server that has
+ *   already stopped answering. Defaults to {@link DEFAULT_DEAD_PROBE_THRESHOLD}
+ *   (3). A single failed probe followed by a successful one resets the
+ *   counter — one blip is not a dead connection.
+ * @param {number} [args.stallWarnMs] How long a live server may go without
+ *   `modelRequestCount`/`totalTokens` growing before a `heartbeat` progress
+ *   event reports `stalled: true`. Purely advisory — the turn is never ended
+ *   for this, since long model "thinking" with no visible progress is normal
+ *   (see docs/zcode-protocol-recon.md and `zcode-companion.mjs`'s own timeout
+ *   defaults for the 10-15 minute silent stretch this was measured against).
+ *   Defaults to {@link DEFAULT_STALL_WARN_MS} (5 minutes).
  * @returns {Promise<RunTurnResult>}
  */
 export async function runTurn({
@@ -374,6 +624,10 @@ export async function runTurn({
   timeoutMs = DEFAULT_TURN_TIMEOUT_MS,
   cancelGraceMs = DEFAULT_CANCEL_GRACE_MS,
   permissionPolicy = DEFAULT_PERMISSION_POLICY,
+  heartbeatIntervalMs = DEFAULT_HEARTBEAT_INTERVAL_MS,
+  heartbeatProbeTimeoutMs = DEFAULT_HEARTBEAT_PROBE_TIMEOUT_MS,
+  deadProbeThreshold = DEFAULT_DEAD_PROBE_THRESHOLD,
+  stallWarnMs = DEFAULT_STALL_WARN_MS,
   clientOptions = {},
 }) {
   if (!PERMISSION_POLICIES.includes(permissionPolicy)) {
@@ -399,6 +653,14 @@ export async function runTurn({
   /** @type {string | null} */
   let sessionId = null;
 
+  // Timestamp of the most recent notification of ANY kind (progress or
+  // terminal) received from the server — the heartbeat monitor's definition
+  // of "silence" (see `createHeartbeatMonitor` above). `null` until the wait
+  // loop actually starts (right after `session/send`), which is also where
+  // this gets its first real value.
+  /** @type {number | null} */
+  let lastEventAt = null;
+
   /** @type {(value: { kind: "completed" | "failed", params: any }) => void} */
   let resolveTerminal;
   const terminalPromise = new Promise((resolve) => {
@@ -411,6 +673,7 @@ export async function runTurn({
     unsubscribers.push(
       client.on(type, (params) => {
         events.push({ type, params });
+        lastEventAt = Date.now();
         safeProgress(onProgress, toProgressEvent(type, params));
       }),
     );
@@ -419,6 +682,7 @@ export async function runTurn({
     unsubscribers.push(
       client.on(type, (params) => {
         events.push({ type, params });
+        lastEventAt = Date.now();
         if (terminalSettled) return; // a stray duplicate must not re-resolve
         terminalSettled = true;
         resolveTerminal({ kind: type === "turn.completed" ? "completed" : "failed", params });
@@ -469,6 +733,14 @@ export async function runTurn({
 
       await client.call("session/send", { sessionId, content: prompt });
 
+      // The wait loop starts now — this is also the heartbeat monitor's
+      // t=0 and its baseline for "silence since the last event" (see
+      // `createHeartbeatMonitor` above and requirement 1/2 of the self-check
+      // spec: an active `session/usage` probe kicks in once nothing has been
+      // heard for `heartbeatIntervalMs`, not on a passive timer alone).
+      const waitStartedAt = Date.now();
+      lastEventAt = waitStartedAt;
+
       const racers = [terminalPromise.then((result) => ({ type: "terminal", ...result }))];
 
       let timeoutTimer;
@@ -489,9 +761,45 @@ export async function runTurn({
         );
       }
 
+      // requirement 5: heartbeatIntervalMs: 0 disables the mechanism
+      // entirely — no timer, no probes, no heartbeat progress events, no
+      // early exit.
+      const heartbeat =
+        heartbeatIntervalMs > 0
+          ? createHeartbeatMonitor({
+              client,
+              sessionId,
+              onProgress,
+              heartbeatIntervalMs,
+              heartbeatProbeTimeoutMs,
+              deadProbeThreshold,
+              stallWarnMs,
+              waitStartedAt,
+              getLastEventAt: () => lastEventAt,
+            })
+          : null;
+      if (heartbeat) racers.push(heartbeat.deadPromise);
+
       const outcome = await Promise.race(racers);
       clearTimeout(timeoutTimer);
       if (signal && abortListener) signal.removeEventListener("abort", abortListener);
+      // Stop probing the instant the race settles for ANY reason — a
+      // terminal event, the real timeout, cancellation, or the heartbeat's
+      // own "dead" verdict below. Otherwise a probe already in flight (or
+      // scheduled) could keep calling session/usage after the turn is
+      // effectively over.
+      heartbeat?.stop();
+
+      // requirement 4: a genuinely dead connection ends the turn immediately
+      // instead of waiting out the rest of `timeoutMs` for nothing — see
+      // `createHeartbeatMonitor`'s doc comment for what counts as "dead".
+      if (outcome.type === "dead") {
+        throw new Error(
+          `ZCode app-server stopped responding: ${outcome.consecutiveFailedProbes} consecutive ` +
+            `session/usage probes failed after the turn had been waiting for ${formatDurationMs(outcome.elapsedMs)} ` +
+            `(sessionId=${sessionId}). Last probe error: ${outcome.probeError ?? "unknown"}.`,
+        );
+      }
 
       // 9. Cancellation: stop, wait briefly for a terminal event, but always
       // report resultType "cancelled" regardless of what (if anything) arrives.
