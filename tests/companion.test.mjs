@@ -752,7 +752,7 @@ describe("runCli — code / review success and failure paths (runTurn stubbed)",
     });
   }
 
-  test("`code` with no --timeout applies the code-specific default (900s = 900000ms)", async () => {
+  test("`code` with no --timeout applies the code-specific default (2700s = 2700000ms)", async () => {
     const sinks = makeSinks();
     let capturedCall = null;
     await runCli(["code", "do", "something"], {
@@ -763,10 +763,10 @@ describe("runCli — code / review success and failure paths (runTurn stubbed)",
         return fakeTurnResult();
       },
     });
-    assert.equal(capturedCall.timeoutMs, 900_000);
+    assert.equal(capturedCall.timeoutMs, 2_700_000);
   });
 
-  test("`review` with no --timeout applies the review-specific default (600s = 600000ms)", async () => {
+  test("`review` with no --timeout applies the review-specific default (1800s = 1800000ms)", async () => {
     const repo = makeGitRepo();
     fs.writeFileSync(path.join(repo, "tracked.txt"), "changed\n");
     const sinks = makeSinks();
@@ -779,7 +779,7 @@ describe("runCli — code / review success and failure paths (runTurn stubbed)",
         return fakeTurnResult();
       },
     });
-    assert.equal(capturedCall.timeoutMs, 600_000);
+    assert.equal(capturedCall.timeoutMs, 1_800_000);
   });
 
   test("code and review defaults differ when neither passes --timeout", async () => {
@@ -989,5 +989,30 @@ describe("runCli — code / review success and failure paths (runTurn stubbed)",
     // must be present — a bare "timed out" message leaves the user stuck.
     assert.match(sinks.stderr(), /Waited 5s/);
     assert.match(sinks.stderr(), /--timeout/);
+    // A small timeout doubling to a slightly bigger one is still a sensible
+    // suggestion (5s -> 10s), unlike doubling a large one (see the test below).
+    assert.match(sinks.stderr(), /--timeout 10\b/);
+  });
+
+  test("a timeout error above the doubling ceiling suggests a +50% bump, not a doubled value", async () => {
+    // Regression guard for the new default (`code` = 2700s / 45min): doubling
+    // an already-large timeout (e.g. suggesting 5400s/90min) reads as an
+    // absurd ask. Past `TIMEOUT_DOUBLING_CEILING_SECONDS`, the suggestion
+    // must scale down to +50% instead of blindly doubling.
+    const sinks = makeSinks();
+    const code = await runCli(["code", "do", "something", "--timeout", "2700"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async () => {
+        throw new Error(
+          "ZCode turn timed out after 2700000ms waiting for turn.completed/turn.failed (sessionId=s1).",
+        );
+      },
+    });
+    assert.equal(code, EXIT_ERROR);
+    assert.match(sinks.stderr(), /Waited 2700s/);
+    // 2700 * 1.5 = 4050 — NOT 5400 (a blind doubling).
+    assert.match(sinks.stderr(), /--timeout 4050\b/);
+    assert.doesNotMatch(sinks.stderr(), /--timeout 5400\b/);
   });
 });

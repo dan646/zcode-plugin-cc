@@ -64,11 +64,23 @@ const DEFAULT_REVIEW_MODEL = { providerId: DEFAULT_PROVIDER_ID, modelId: "glm-5.
 // NOT sized for what `code`/`review` actually do, which is multi-round-trip,
 // tool-using work. A live `/zcode:review` run against one modest file in
 // this repo took six separate model round-trips inside a single turn, so
-// 180s is tight on an ordinary diff, not just a pathological one. `code`
-// gets an even higher default since it does at least as much tool-calling.
+// 180s is tight on an ordinary diff, not just a pathological one.
+//
+// The two numbers below come from real usage rather than that recon alone:
+// running ZCode headless against an actual project (a dockerized Laravel
+// app) via this plugin, a single unit of work took 20-30 minutes end to
+// end, with the first 10-15 minutes producing no visible output at all
+// (the model "thinks" before anything streams back) before the rest arrives
+// in a burst. The old 900s/600s defaults would have timed out roughly every
+// other `code` run under that pattern, and sooner on a `review` of anything
+// but a small diff. `DEFAULT_CODE_TIMEOUT_SECONDS` is set to 2700s (45min)
+// — the upper end of the observed 20-30min range plus headroom for a slow
+// start and a correction round or two — and `DEFAULT_REVIEW_TIMEOUT_SECONDS`
+// to 1800s (30min), scaled down from that since a review is one pass over
+// an existing diff rather than `code`'s open-ended implement-and-fix loop.
 // A user's own `--timeout` always overrides these.
-const DEFAULT_CODE_TIMEOUT_SECONDS = 900;
-const DEFAULT_REVIEW_TIMEOUT_SECONDS = 600;
+const DEFAULT_CODE_TIMEOUT_SECONDS = 2700;
+const DEFAULT_REVIEW_TIMEOUT_SECONDS = 1800;
 
 // Valid `--mode` values for `session/setMode`. Confirmed by grepping the
 // bundled `zcode.cjs` for the literal zod enum `["build","edit","plan","yolo"]`
@@ -268,23 +280,46 @@ function isRunTurnTimeout(err) {
   return err instanceof Error && /ZCode turn timed out after \d+ms/.test(err.message);
 }
 
+// Above this size, doubling `--timeout` stops being a sensible suggestion —
+// e.g. the current 2700s (45min) `code` default doubling to 5400s (90min).
+// Doubling is fine below it (a 5s test timeout becoming 10s is a reasonable
+// ask); above it, `suggestNextTimeoutSeconds` switches to a flat +50% bump
+// instead of blindly scaling the multiplier with an already-large number.
+const TIMEOUT_DOUBLING_CEILING_SECONDS = 300; // 5 minutes
+
+/**
+ * Pick a concrete next `--timeout` value to suggest after a timeout, given
+ * the seconds value that just timed out. Doubling reads fine for a small
+ * timeout but turns absurd for a large one (45min -> 90min), so this scales
+ * the increase down as the input grows rather than always doubling.
+ * @param {number} seconds
+ * @returns {number}
+ */
+function suggestNextTimeoutSeconds(seconds) {
+  if (seconds <= TIMEOUT_DOUBLING_CEILING_SECONDS) {
+    return seconds * 2;
+  }
+  return Math.round(seconds * 1.5);
+}
+
 /**
  * Turn `runTurn`'s generic timeout error into something a user can act on:
  * how long the companion actually waited (in the human unit, seconds — the
- * raw error only states milliseconds) plus the exact flag to raise it with.
- * `lib/session.mjs` itself has no opinion on `--timeout`, since that flag is
- * a companion-level concept layered on top of its `timeoutMs` parameter —
- * this is why the enhancement happens here, not there.
+ * raw error only states milliseconds), naming that value explicitly, plus a
+ * concrete increased value to try instead. `lib/session.mjs` itself has no
+ * opinion on `--timeout`, since that flag is a companion-level concept
+ * layered on top of its `timeoutMs` parameter — this is why the enhancement
+ * happens here, not there.
  * @param {Error} err
  * @param {number} timeoutMs the value this call actually passed to `runTurn`
  * @returns {Error}
  */
 function toActionableTimeoutError(err, timeoutMs) {
   const seconds = Math.round(timeoutMs / 1000);
-  const suggestedSeconds = seconds * 2;
+  const suggestedSeconds = suggestNextTimeoutSeconds(seconds);
   const enhanced = new Error(
-    `${err.message} Waited ${seconds}s before giving up. If this keeps happening on real work, ` +
-      `raise the limit with --timeout <seconds> (e.g. --timeout ${suggestedSeconds}).`,
+    `${err.message} Waited ${seconds}s (current --timeout) before giving up. If this keeps ` +
+      `happening on real work, raise the limit — try --timeout ${suggestedSeconds}.`,
   );
   enhanced.cause = err;
   return enhanced;

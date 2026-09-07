@@ -21,7 +21,7 @@ This is review-only: do not apply any fixes yourself, and do not treat ZCode's f
 
 If the command fails because there is nothing to review or the directory is not a git repository, relay that message directly rather than retrying with different arguments.
 
-A real review is several model round-trips (tool calls to read the diffed files, reason about them, etc.), so `review` defaults to a 600-second turn timeout rather than a single-request 180s. If a large diff still times out, retry with a higher `--timeout <seconds>` — the timeout error names how long it waited and that this is the flag to raise.
+A real review is several model round-trips (tool calls to read the diffed files, reason about them, etc.), so `review` defaults to a 1800-second (30-minute) turn timeout rather than a single-request 180s — scaled down from `code`'s 2700s default (see `code.md`) since a review is one pass over an existing diff rather than an open-ended implement-and-fix loop. If a large diff still times out, retry with a higher `--timeout <seconds>` — the timeout error names the current timeout and suggests a concrete higher one.
 
 `--mode <build|edit|plan|yolo>` switches ZCode's own operating mode for this turn (via `session/setMode`) — it is **not** this plugin's write permission. `review` always runs with `permissionPolicy: "allow"` so ZCode can actually use its tools to read the files a diff touches, with or without `--mode`. `--mode` instead changes how ZCode's own agent behaves once it has that access (e.g. `plan` proposes rather than acts); it does not add or remove a review-only guarantee.
 
