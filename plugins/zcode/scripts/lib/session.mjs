@@ -206,13 +206,39 @@ function toProgressEvent(type, params) {
   // model.streaming (and any other session event) — full envelope, data
   // under `payload`.
   const payload = params?.payload ?? {};
-  return {
+  const event = {
     type,
     kind: payload.kind,
     delta: payload.delta,
     done: payload.done,
     assistantMessageId: payload.assistantMessageId,
   };
+
+  // Tool-call visibility (headless-progress requirement): confirmed against
+  // a live, logged-in app-server by driving a turn that calls Read/Bash/Edit
+  // and dumping every `model.streaming` `payload.kind` actually seen. A tool
+  // call's arguments stream in three stages — `tool_input_start` (empty),
+  // `tool_input_delta` (a fragment of partial JSON), `tool_input_end`
+  // (empty) — and only THEN does a fourth, distinct kind, `tool_call`, arrive
+  // carrying `toolName` and the fully-assembled `input` object in one piece
+  // (e.g. `{file_path: "..."}` for Read, `{command: "..."}` for Bash). Only
+  // `tool_call` is surfaced here: reassembling a stream of partial JSON
+  // fragments from `tool_input_delta` is exactly the kind of fragile parsing
+  // this project avoids elsewhere (see `explainProtocolError`'s handling of
+  // the server's own JSON-string-of-issues), and would just reproduce, by
+  // hand, the assembly the server has already done for `tool_call`.
+  //
+  // These three keys are added only for `kind === "tool_call"` — never
+  // unconditionally — so every other kind's event shape (in particular
+  // `text_delta`/`reasoning_delta`, pinned by an exact `deepEqual` in
+  // tests/session.test.mjs) is completely unaffected.
+  if (payload.kind === "tool_call") {
+    event.toolCallId = payload.toolCallId;
+    event.toolName = payload.toolName;
+    event.input = payload.input;
+  }
+
+  return event;
 }
 
 /**
@@ -427,6 +453,16 @@ export async function runTurn({
       if (model) {
         await client.call("session/setModel", { sessionId, model });
       }
+      // Per-session ZCode operating mode. Confirmed against the bundled
+      // `zcode.cjs` (grep for the literal `["build","edit","plan","yolo"]`
+      // enum `session/setMode` validates against) — this is ZCode's own
+      // agentic behavior (e.g. `plan` proposes changes without making them),
+      // completely orthogonal to this library's `permissionPolicy` above
+      // (whether *this client* auto-answers `interaction/requestPermission`
+      // requests). `mode` is passed through verbatim and unvalidated here —
+      // validating against the four known values is `zcode-companion.mjs`'s
+      // job (see its `parseModeFlag`), the same division of labor as
+      // `permissionPolicy` is validated here rather than at the transport.
       if (mode) {
         await client.call("session/setMode", { sessionId, mode });
       }

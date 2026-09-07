@@ -26,6 +26,7 @@ import path from "node:path";
 import { resolveZcodeCli, workspaceRef } from "../plugins/zcode/scripts/lib/locate.mjs";
 import { ZCodeProtocolClient } from "../plugins/zcode/scripts/lib/protocol.mjs";
 import { runTurn } from "../plugins/zcode/scripts/lib/session.mjs";
+import { formatToolCallLine } from "../plugins/zcode/scripts/zcode-companion.mjs";
 
 const WS = process.env.ZPROBE_WS ?? process.cwd();
 const ws = workspaceRef(WS);
@@ -235,6 +236,67 @@ const deniedContent = await runWritePermissionProbe("deny");
 check("permissionPolicy: \"deny\" — файл НЕ должен появиться на диске", () => {
   assert.equal(deniedContent, null, `marker file should not exist, but found content: ${JSON.stringify(deniedContent)}`);
 });
+
+// --------------------------------------------------------- прогресс: вызовы инструментов
+//
+// User report: headless progress only ever printed coarse milestones
+// (model_changed/prompt_started/prompt_completed) — no way to tell "working"
+// from "hung". The fix reads `model.streaming` events shaped `kind:
+// "tool_call"` (see zcode-companion.mjs's `formatToolCallLine` doc comment
+// for how that shape was found empirically against this same live server)
+// and turns them into one stderr line per tool call. This section drives a
+// real turn guaranteed to call a tool and checks that at least one resulting
+// line actually names the tool — not just that *some* progress event fired,
+// which every other check in this file already covers and would pass even if
+// tool calls were invisible.
+
+console.log("\n— прогресс: строка о вызове инструмента (tool.updated / model.streaming tool_call) —");
+
+/**
+ * @returns {Promise<string[]>} every progress line `formatToolCallLine` would
+ *   have printed to stderr for one real turn that reads a file it can only
+ *   know about by actually calling its file-reading tool.
+ */
+async function runToolCallProgressProbe() {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "zcode-tool-progress-probe-"));
+  fs.writeFileSync(path.join(dir, "probe-notes.txt"), "line one\nline two\nline three\n");
+  const lines = [];
+  try {
+    await runTurn({
+      cli,
+      workspace: workspaceRef(dir),
+      prompt:
+        "Read the file probe-notes.txt in the current directory using your file-reading tool, " +
+        "right away — no clarifying questions, no explanation needed afterward.",
+      timeoutMs: 90_000,
+      onProgress: (event) => {
+        const line = formatToolCallLine(event);
+        if (line) lines.push(line);
+      },
+    });
+  } catch {
+    // Ignored on purpose: this probe only cares about what progress looked
+    // like while the turn ran, not whether the turn itself succeeded.
+  }
+  fs.rmSync(dir, { recursive: true, force: true });
+  return lines;
+}
+
+const toolProgressLines = await runToolCallProgressProbe();
+check("ход с вызовом инструмента даёт хотя бы одну строку прогресса вида '[zcode] tool: <имя> ...'", () => {
+  assert.ok(
+    toolProgressLines.length > 0,
+    "formatToolCallLine produced zero lines for a turn that was asked to use a tool " +
+      "— either no tool_call progress event arrived, or the wire shape has drifted",
+  );
+  assert.ok(
+    toolProgressLines.some((line) => /^\[zcode\] tool: \S/.test(line)),
+    `no line matches the expected "[zcode] tool: <name> ..." shape: ${JSON.stringify(toolProgressLines)}`,
+  );
+});
+if (toolProgressLines.length > 0) {
+  console.log(`  (пример) ${toolProgressLines[0]}`);
+}
 
 console.log(failures === 0 ? "\nРЕЗУЛЬТАТ: УСПЕХ" : `\nРЕЗУЛЬТАТ: ПРОВАЛ (${failures})`);
 process.exit(failures === 0 ? 0 : 1);

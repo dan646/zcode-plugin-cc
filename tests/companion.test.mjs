@@ -18,8 +18,11 @@ import {
   runCli,
   parseModelFlag,
   parseTimeoutFlag,
+  parseModeFlag,
+  formatToolCallLine,
   buildCodePrompt,
   buildReviewPrompt,
+  ZCODE_MODES,
   EXIT_OK,
   EXIT_ERROR,
   EXIT_TURN_FAILED,
@@ -310,6 +313,109 @@ describe("parseTimeoutFlag", () => {
       assert.throws(() => parseTimeoutFlag(bad), /--timeout must be a positive number of seconds/);
     });
   }
+});
+
+// --------------------------------------------------------------- parseModeFlag
+
+describe("parseModeFlag", () => {
+  test("undefined yields null (caller leaves runTurn's mode unset)", () => {
+    assert.equal(parseModeFlag(undefined), null);
+  });
+
+  for (const mode of ZCODE_MODES) {
+    test(`accepts the known value ${JSON.stringify(mode)}`, () => {
+      assert.equal(parseModeFlag(mode), mode);
+    });
+  }
+
+  test("rejects an unknown value, listing the allowed ones", () => {
+    assert.throws(() => parseModeFlag("god-mode"), (err) => {
+      assert.match(err.message, /--mode must be one of: build, edit, plan, yolo/);
+      assert.match(err.message, /"god-mode"/);
+      return true;
+    });
+  });
+
+  test("rejects a bare boolean --mode (no value given)", () => {
+    assert.throws(() => parseModeFlag(true), /--mode requires a value/);
+  });
+
+  test("error message clarifies --mode is not this plugin's write permission", () => {
+    assert.throws(() => parseModeFlag("bogus"), /not this plugin's write permission/);
+  });
+});
+
+// ------------------------------------------------------------ formatToolCallLine
+
+describe("formatToolCallLine", () => {
+  test("null for anything that is not a model.streaming tool_call event", () => {
+    assert.equal(formatToolCallLine(null), null);
+    assert.equal(formatToolCallLine({ type: "state.updated", reason: "prompt_started" }), null);
+    assert.equal(formatToolCallLine({ type: "model.streaming", kind: "text_delta", delta: "hi" }), null);
+    assert.equal(formatToolCallLine({ type: "model.streaming", kind: "tool_call" }), null); // no toolName
+  });
+
+  test("prefers a known argument field (file_path) as the summary", () => {
+    const line = formatToolCallLine({
+      type: "model.streaming",
+      kind: "tool_call",
+      toolName: "Read",
+      input: { file_path: "/repo/README.md" },
+    });
+    assert.equal(line, "[zcode] tool: Read /repo/README.md");
+  });
+
+  test("prefers 'command' for a shell-style tool call", () => {
+    const line = formatToolCallLine({
+      type: "model.streaming",
+      kind: "tool_call",
+      toolName: "Bash",
+      input: { command: "wc -l notes.txt", description: "count lines" },
+    });
+    assert.equal(line, "[zcode] tool: Bash wc -l notes.txt");
+  });
+
+  test("falls back to the whole input object for an unrecognized tool shape", () => {
+    const line = formatToolCallLine({
+      type: "model.streaming",
+      kind: "tool_call",
+      toolName: "SomeFutureTool",
+      input: { widgetId: 42 },
+    });
+    assert.equal(line, '[zcode] tool: SomeFutureTool {"widgetId":42}');
+  });
+
+  test("shows just the tool name when there is no input at all", () => {
+    const line = formatToolCallLine({ type: "model.streaming", kind: "tool_call", toolName: "TodoRead", input: {} });
+    assert.equal(line, "[zcode] tool: TodoRead");
+  });
+
+  test("truncates a very long argument instead of flooding stderr", () => {
+    const longCommand = "echo " + "x".repeat(500);
+    const line = formatToolCallLine({
+      type: "model.streaming",
+      kind: "tool_call",
+      toolName: "Bash",
+      input: { command: longCommand },
+    });
+    assert.ok(line.length < longCommand.length, "the line must be shorter than the raw argument");
+    assert.match(line, /\[truncated \d+ chars\]/);
+  });
+
+  // The actual defect this guards: a tool call argument shaped like the
+  // provider-config secret field (`"apiKey": ...`) must never reach stderr
+  // verbatim — see lib/protocol.mjs's redactSecrets/API_KEY_PATTERN, reused
+  // here rather than reimplemented.
+  test("redacts a secret-shaped ('apiKey') argument the same way lib/protocol.mjs does", () => {
+    const line = formatToolCallLine({
+      type: "model.streaming",
+      kind: "tool_call",
+      toolName: "SomeTool",
+      input: { apiKey: "sk-super-secret-value", other: "fine" },
+    });
+    assert.doesNotMatch(line, /sk-super-secret-value/);
+    assert.match(line, /"apiKey":"\[REDACTED\]"/);
+  });
 });
 
 // ------------------------------------------------------------------ runCli
@@ -702,6 +808,169 @@ describe("runCli — code / review success and failure paths (runTurn stubbed)",
     });
 
     assert.notEqual(codeCall.timeoutMs, reviewCall.timeoutMs);
+  });
+
+  // -------------------------------------------------------------------- --mode
+
+  test("`code --mode plan` reaches runTurn as mode: 'plan'", async () => {
+    const sinks = makeSinks();
+    let capturedCall = null;
+    const code = await runCli(["code", "do", "something", "--mode", "plan"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        capturedCall = args;
+        return fakeTurnResult();
+      },
+    });
+    assert.equal(code, EXIT_OK);
+    assert.equal(capturedCall.mode, "plan");
+    // --mode must NOT change permissionPolicy — see zcode-companion.mjs's
+    // ZCODE_MODES doc comment on why the two are separate concerns.
+    assert.equal(capturedCall.permissionPolicy, "allow");
+  });
+
+  test("`review --mode edit` reaches runTurn as mode: 'edit'", async () => {
+    const repo = makeGitRepo();
+    fs.writeFileSync(path.join(repo, "tracked.txt"), "changed\n");
+    const sinks = makeSinks();
+    let capturedCall = null;
+    const code = await runCli(["review", "--cwd", repo, "--mode", "edit"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        capturedCall = args;
+        return fakeTurnResult();
+      },
+    });
+    assert.equal(code, EXIT_OK);
+    assert.equal(capturedCall.mode, "edit");
+  });
+
+  test("`code` with no --mode leaves runTurn's mode undefined", async () => {
+    const sinks = makeSinks();
+    let capturedCall = null;
+    await runCli(["code", "do", "something"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        capturedCall = args;
+        return fakeTurnResult();
+      },
+    });
+    assert.equal(capturedCall.mode, undefined);
+  });
+
+  test("`code --mode bogus` is rejected with a non-zero exit, without calling runTurn", async () => {
+    const sinks = makeSinks();
+    let called = false;
+    const code = await runCli(["code", "do", "something", "--mode", "bogus"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async () => {
+        called = true;
+        return fakeTurnResult();
+      },
+    });
+    assert.equal(code, EXIT_ERROR);
+    assert.equal(called, false);
+    assert.match(sinks.stderr(), /--mode must be one of: build, edit, plan, yolo/);
+  });
+
+  test("`review --mode bogus` is rejected with a non-zero exit, without calling runTurn", async () => {
+    const repo = makeGitRepo();
+    fs.writeFileSync(path.join(repo, "tracked.txt"), "changed\n");
+    const sinks = makeSinks();
+    let called = false;
+    const code = await runCli(["review", "--cwd", repo, "--mode", "bogus"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async () => {
+        called = true;
+        return fakeTurnResult();
+      },
+    });
+    assert.equal(code, EXIT_ERROR);
+    assert.equal(called, false);
+    assert.match(sinks.stderr(), /--mode must be one of: build, edit, plan, yolo/);
+  });
+
+  // ------------------------------------------------------------------- --quiet
+
+  test("`code --quiet` suppresses per-step progress but the final response/footer still print", async () => {
+    const sinks = makeSinks();
+    const code = await runCli(["code", "do", "something", "--quiet"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        // Simulate a real turn's progress stream: a state transition, a tool
+        // call, and streamed model text — none of it must reach logError.
+        args.onProgress({ type: "state.updated", reason: "prompt_started" });
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_call",
+          toolName: "Bash",
+          input: { command: "wc -l notes.txt" },
+        });
+        args.onProgress({ type: "model.streaming", kind: "text_delta", delta: "some streamed text" });
+        return fakeTurnResult();
+      },
+    });
+    assert.equal(code, EXIT_OK);
+    assert.match(sinks.stdout(), /done: implemented the thing/);
+    assert.doesNotMatch(sinks.stderr(), /prompt_started/);
+    assert.doesNotMatch(sinks.stderr(), /tool: Bash/);
+    assert.doesNotMatch(sinks.stderr(), /some streamed text/);
+    // The final summary footer (turn/session usage) is unaffected by --quiet.
+    assert.match(sinks.stderr(), /turn usage:/);
+  });
+
+  test("raw tool_input_delta fragments (partial JSON tool arguments) never reach stderr", async () => {
+    // Regression guard: the previous makeOnProgress forwarded ANY non-empty
+    // model.streaming delta unconditionally, which included tool_input_delta
+    // — a tool call's arguments streaming character-by-character as raw,
+    // unredacted, uncapped partial JSON. A secret-shaped argument (e.g.
+    // apiKey) could leak here well before the assembled tool_call event (and
+    // its safe formatToolCallLine summary) ever arrived.
+    const sinks = makeSinks();
+    const code = await runCli(["code", "do", "something"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({ type: "model.streaming", kind: "tool_input_start", delta: "" });
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_input_delta",
+          delta: '{"apiKey":"sk-super-secret-value"',
+        });
+        args.onProgress({ type: "model.streaming", kind: "tool_input_end", delta: "" });
+        return fakeTurnResult();
+      },
+    });
+    assert.equal(code, EXIT_OK);
+    assert.doesNotMatch(sinks.stderr(), /sk-super-secret-value/);
+    assert.doesNotMatch(sinks.stderr(), /apiKey/);
+  });
+
+  test("without --quiet, the same progress stream DOES reach stderr (control for the test above)", async () => {
+    const sinks = makeSinks();
+    const code = await runCli(["code", "do", "something"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({ type: "state.updated", reason: "prompt_started" });
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_call",
+          toolName: "Bash",
+          input: { command: "wc -l notes.txt" },
+        });
+        return fakeTurnResult();
+      },
+    });
+    assert.equal(code, EXIT_OK);
+    assert.match(sinks.stderr(), /prompt_started/);
+    assert.match(sinks.stderr(), /tool: Bash wc -l notes\.txt/);
   });
 
   test("a runTurn timeout error is enhanced with the wait time and a --timeout suggestion", async () => {

@@ -157,6 +157,32 @@ describe("runTurn — successful path", () => {
     }
   });
 
+  test("calls session/setMode only when a mode is given, and never otherwise", async () => {
+    const noModeSpy = spyOnCalls();
+    try {
+      await runTurn({ cli: FIXTURE_CLI, workspace: scenarioWorkspace("success"), prompt: "hi" });
+      assert.ok(!noModeSpy.calls.some((c) => c.method === "session/setMode"));
+    } finally {
+      noModeSpy.restore();
+    }
+
+    const withModeSpy = spyOnCalls();
+    try {
+      const result = await runTurn({
+        cli: FIXTURE_CLI,
+        workspace: scenarioWorkspace("success"),
+        prompt: "hi",
+        mode: "plan",
+      });
+      assert.equal(result.resultType, "completed");
+      const setModeCall = withModeSpy.calls.find((c) => c.method === "session/setMode");
+      assert.ok(setModeCall, "session/setMode must be called when mode is provided");
+      assert.deepEqual(setModeCall.params, { sessionId: result.sessionId, mode: "plan" });
+    } finally {
+      withModeSpy.restore();
+    }
+  });
+
   test("a throwing onProgress does not break the turn", async () => {
     const result = await runTurn({
       cli: FIXTURE_CLI,
@@ -399,6 +425,43 @@ describe("runTurn — two message classes (docs/zcode-protocol-recon.md, \"Дв�
       { type: "model.streaming", kind: "reasoning_delta", delta: "Hel", done: false, assistantMessageId: "m1" },
       { type: "model.streaming", kind: "text_delta", delta: "lo!", done: true, assistantMessageId: "m1" },
     ]);
+  });
+});
+
+describe("runTurn — tool-call progress (headless visibility)", () => {
+  test("a model.streaming kind:'tool_call' event surfaces toolName/toolCallId/input on the progress event", async () => {
+    const progressEvents = [];
+    const result = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("tool-call"),
+      prompt: "hi",
+      onProgress: (event) => progressEvents.push(event),
+    });
+    assert.equal(result.resultType, "completed");
+
+    const toolCallEvent = progressEvents.find((e) => e.type === "model.streaming" && e.kind === "tool_call");
+    assert.ok(toolCallEvent, "onProgress must receive the tool_call event");
+    assert.deepEqual(toolCallEvent, {
+      type: "model.streaming",
+      kind: "tool_call",
+      delta: "",
+      done: false,
+      assistantMessageId: "m1",
+      toolCallId: "call_fake1",
+      toolName: "Bash",
+      input: { command: "wc -l notes.txt", description: "Count lines in notes.txt" },
+    });
+
+    // Every OTHER model.streaming kind must be completely unaffected — no
+    // stray toolCallId/toolName/input keys leaking onto text/reasoning
+    // deltas (this is what the exact deepEqual in the "two message classes"
+    // describe block above already pins; this just double-checks the
+    // negative here too).
+    const textEvent = progressEvents.find((e) => e.type === "model.streaming" && e.kind === "text_delta");
+    assert.ok(textEvent);
+    assert.equal(textEvent.toolCallId, undefined);
+    assert.equal(textEvent.toolName, undefined);
+    assert.equal(textEvent.input, undefined);
   });
 });
 

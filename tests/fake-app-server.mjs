@@ -162,6 +162,11 @@ function emitStateUpdated(sessionId, { patch, reason, revision, scope }) {
  *   - "usage-fail": identical event stream to "success" — only `session/usage`
  *     behaves differently for this scenario (see the `session/usage` case
  *     below), to exercise the caller's fallback when that call fails.
+ *   - "tool-call": identical to "success", plus one extra `model.streaming`
+ *     event with `kind: "tool_call"` between the two text deltas — the shape
+ *     confirmed against a live app-server (see zcode-companion.mjs's
+ *     `formatToolCallLine` doc comment) that carries a tool's name and its
+ *     fully-assembled arguments in one message.
  * @param {string} sessionId
  * @param {string} scenario
  * @param {() => string[]} getScopesSeen
@@ -215,6 +220,22 @@ function scheduleTurnEvents(sessionId, scenario, getScopesSeen) {
       }),
     15,
   );
+
+  if (scenario === "tool-call") {
+    setTimeout(
+      () =>
+        emitEvent(sessionId, "model.streaming", {
+          assistantMessageId: "m1",
+          delta: "",
+          done: false,
+          kind: "tool_call",
+          toolCallId: "call_fake1",
+          toolName: "Bash",
+          input: { command: "wc -l notes.txt", description: "Count lines in notes.txt" },
+        }),
+      17,
+    );
+  }
 
   if (scenario === "failure") {
     setTimeout(

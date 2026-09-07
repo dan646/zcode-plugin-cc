@@ -5,13 +5,13 @@
   },
   "metadata": {
     "description": "ZCode plugin for Claude Code: delegate coding and review to ZCode (GLM).",
-    "version": "0.1.1"
+    "version": "0.2.0"
   },
   "plugins": [
     {
       "name": "zcode",
       "description": "Use ZCode (GLM) from Claude Code to write and review code.",
-      "version": "0.1.1",
+      "version": "0.2.0",
       "author": {
         "name": "daniarergaliev"
       },

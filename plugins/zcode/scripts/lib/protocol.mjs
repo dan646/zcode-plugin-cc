@@ -112,10 +112,17 @@ const API_KEY_PATTERN = /"apiKey"\s*:\s*(\{(?:[^{}]|\{[^{}]*\})*\}|"(?:[^"\\]|\\
  * provider-config schema (see `API_KEY_PATTERN` above) — not a general-purpose
  * secret scanner for arbitrary text. Applied centrally by `_logDiag()` (see
  * `ZCodeProtocolClient`) so this one case only needs handling once.
+ *
+ * Exported so other diagnostic sinks in this project (e.g.
+ * `zcode-companion.mjs`'s tool-call progress line, which prints a model
+ * tool's arguments straight from the wire) apply the exact same narrow,
+ * regex-safe redaction instead of inventing a second one — see this
+ * function's own doc comment above for why a broader, generic scrubber is
+ * deliberately not what this does.
  * @param {string} text
  * @returns {string}
  */
-function redactSecrets(text) {
+export function redactSecrets(text) {
   if (typeof text !== "string") return text;
   return text.replace(API_KEY_PATTERN, '"apiKey":"[REDACTED]"');
 }
@@ -130,11 +137,15 @@ function redactSecrets(text) {
 const MAX_DIAG_TEXT_LENGTH = 2000;
 
 /**
+ * Hard-cap the length of a piece of diagnostic text before anything else
+ * (redaction included) touches it — see `MAX_DIAG_TEXT_LENGTH` above.
+ * Exported for the same reason as `redactSecrets`: other diagnostic sinks in
+ * this project should cap length the same way, not invent their own.
  * @param {string} text
  * @param {number} [max]
  * @returns {string}
  */
-function capDiagText(text, max = MAX_DIAG_TEXT_LENGTH) {
+export function capDiagText(text, max = MAX_DIAG_TEXT_LENGTH) {
   const str = String(text);
   return str.length > max ? `${str.slice(0, max)}…[truncated ${str.length - max} chars]` : str;
 }

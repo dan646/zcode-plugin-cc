@@ -10,11 +10,15 @@
  *
  * Subcommands: `setup`, `code <task>`, `review [target]`, `status`.
  *
- * Everything that talks to ZCode goes through `lib/session.mjs`
+ * Everything that *talks to ZCode* goes through `lib/session.mjs`
  * (`runTurn`, `readWorkspaceState`, `isProviderConfigured`) and
- * `lib/locate.mjs` (`resolveZcodeCli`, `workspaceRef`) — never directly at
- * `lib/protocol.mjs`. Both of those modules, plus `lib/session.mjs` itself,
- * are out of scope for this unit and are only ever imported, never edited.
+ * `lib/locate.mjs` (`resolveZcodeCli`, `workspaceRef`) — this file never
+ * constructs a `ZCodeProtocolClient` or calls its methods directly. It does
+ * import two pure, side-effect-free text-safety helpers straight from
+ * `lib/protocol.mjs` (`redactSecrets`, `capDiagText`) for the headless
+ * tool-call progress line below — reusing the transport's own
+ * secret-redaction/length-cap approach instead of inventing a second one,
+ * per the same reasoning as `explainProtocolError`'s use of them.
  */
 import path from "node:path";
 import process from "node:process";
@@ -25,6 +29,7 @@ import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
 import { buildReviewDiff } from "./lib/diff.mjs";
 import { resolveZcodeCli, workspaceRef } from "./lib/locate.mjs";
 import { runTurn, readWorkspaceState, isProviderConfigured } from "./lib/session.mjs";
+import { redactSecrets, capDiagText } from "./lib/protocol.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 /** Plugin root — the directory that contains `prompts/` (see `lib/prompts.mjs`). */
@@ -65,6 +70,25 @@ const DEFAULT_REVIEW_MODEL = { providerId: DEFAULT_PROVIDER_ID, modelId: "glm-5.
 const DEFAULT_CODE_TIMEOUT_SECONDS = 900;
 const DEFAULT_REVIEW_TIMEOUT_SECONDS = 600;
 
+// Valid `--mode` values for `session/setMode`. Confirmed by grepping the
+// bundled `zcode.cjs` for the literal zod enum `["build","edit","plan","yolo"]`
+// that `sessionSetMode`'s params schema validates `mode` against — not
+// documented anywhere, and not the same list as ZCode's *interactive CLI*
+// `--mode`/`--surface` flags (see docs/zcode-protocol-recon.md's "Часть
+// документированных флагов CLI не реализована"), which is a different
+// surface entirely from the app-server protocol this plugin drives.
+//
+// IMPORTANT — this is ZCode's own agent-behavior mode, NOT this plugin's
+// write permission: `code`/`review` already always pass `permissionPolicy:
+// "allow"` to `runTurn` regardless of `--mode` (see their call sites below),
+// so ZCode is always ALLOWED to write files. `--mode` instead tells ZCode's
+// own agent loop how it should behave with that permission — e.g. "plan"
+// makes it propose a plan without touching any files even though it *could*,
+// "yolo" skips ZCode's own internal confirmations. Conflating the two is
+// exactly the confusion this constant's users must be warned against — see
+// the USAGE_TEXT entry, and commands/code.md / commands/review.md / README.md.
+export const ZCODE_MODES = Object.freeze(["build", "edit", "plan", "yolo"]);
+
 export const EXIT_OK = 0;
 export const EXIT_ERROR = 1;
 /** Exit code used specifically for a `turn.failed` result (see `lib/session.mjs`'s `runTurn`). */
@@ -83,6 +107,17 @@ Common options:
   --cwd <path>              Working directory (default: current directory)
   --json                    Machine-readable output (setup, status)
   --timeout <seconds>       Turn timeout in seconds (code/review only; defaults: code=${DEFAULT_CODE_TIMEOUT_SECONDS}, review=${DEFAULT_REVIEW_TIMEOUT_SECONDS})
+  --mode <${ZCODE_MODES.join("|")}>
+                            ZCode's own operating mode for this turn (code/review only). This is
+                            NOT this plugin's write permission — code/review already always pass
+                            permissionPolicy: "allow" to runTurn, with or without --mode, so ZCode
+                            CAN write files either way. --mode instead tells ZCode's own agent how
+                            to behave once it has that permission: "plan" makes it propose a plan
+                            without touching files, "edit" restricts it to editing existing files,
+                            "yolo" skips its own internal confirmations, "build" is its default.
+                            Defaults to whatever ZCode's own session default is when omitted.
+  --quiet                   Suppress per-step progress on stderr (state changes, tool calls);
+                            print only the final response/summary (code/review only)
 `;
 
 /** Thrown for bad CLI usage (missing/invalid arguments) — always maps to {@link EXIT_ERROR}. */
@@ -143,6 +178,40 @@ export function parseModelFlag(raw) {
     return { providerId: DEFAULT_PROVIDER_ID, modelId: trimmed };
   }
   return { providerId: trimmed.slice(0, slashIndex), modelId: trimmed.slice(slashIndex + 1) };
+}
+
+/**
+ * Parse a `--mode` value for `runTurn`'s `mode` (forwarded verbatim to
+ * `session/setMode` — see lib/session.mjs). Validated against the four known
+ * values (see {@link ZCODE_MODES}) with an error that spells out the
+ * allowed list, since an unknown value would otherwise only surface as an
+ * opaque `session/setMode` protocol rejection deep inside `runTurn`.
+ *
+ * This is deliberately validated here, at the CLI boundary, and not inside
+ * `lib/session.mjs`: `mode`'s valid values are a ZCode-specific fact (reverse
+ * engineered from the bundle, see {@link ZCODE_MODES}'s comment), not a
+ * protocol-transport concern — the same division of labor `--model`/
+ * `--timeout` already follow.
+ * @param {string | boolean | undefined} raw
+ * @returns {string | null} `null` when `--mode` was not passed at all —
+ *   callers leave `runTurn`'s `mode` unset, so ZCode falls back to its own
+ *   session default.
+ * @throws {UsageError} for anything not in {@link ZCODE_MODES}.
+ */
+export function parseModeFlag(raw) {
+  if (raw === undefined) return null;
+  if (raw === true || raw === false || !String(raw).trim()) {
+    throw new UsageError(`--mode requires a value — one of: ${ZCODE_MODES.join(", ")} (got: ${JSON.stringify(raw)}).`);
+  }
+  const trimmed = String(raw).trim();
+  if (!ZCODE_MODES.includes(trimmed)) {
+    throw new UsageError(
+      `--mode must be one of: ${ZCODE_MODES.join(", ")} (got: ${JSON.stringify(raw)}). ` +
+        'Note: --mode controls ZCode\'s own operating mode for this turn, not this plugin\'s write ' +
+        'permission (code/review always allow writes regardless of --mode) — see --help.',
+    );
+  }
+  return trimmed;
 }
 
 /**
@@ -221,16 +290,85 @@ function toActionableTimeoutError(err, timeoutMs) {
   return enhanced;
 }
 
+// Fields to prefer, in order, as the one-line argument summary for a tool
+// call's progress line — picked from what the live server's `tool_call`
+// events actually carry for the tools most likely to show up in a `code`/
+// `review` turn (Read/Write/Edit's `file_path`, Bash's `command`, Grep/Glob's
+// `pattern`, WebFetch's `url`). Falls back to the whole `input` object
+// (JSON-stringified) for any tool this list does not name, rather than
+// showing nothing for it.
+const TOOL_CALL_ARG_FIELDS = ["file_path", "path", "notebook_path", "command", "pattern", "url", "query"];
+
+/** Hard cap on a tool-call progress line's argument summary — a long file
+ * path or shell command must not make one line dominate the whole stream. */
+const MAX_TOOL_ARG_DISPLAY_LENGTH = 160;
+
+/**
+ * Build the one-line, human-scannable argument summary for a tool-call
+ * progress event (see {@link TOOL_CALL_ARG_FIELDS}).
+ * @param {unknown} input `event.input` from a `kind: "tool_call"` progress event
+ * @returns {string} possibly empty
+ */
+function summarizeToolCallInput(input) {
+  if (!input || typeof input !== "object") return "";
+  const knownField = TOOL_CALL_ARG_FIELDS.find((field) => typeof input[field] === "string" && input[field]);
+  if (knownField) return input[knownField];
+  return Object.keys(input).length > 0 ? JSON.stringify(input) : "";
+}
+
+/**
+ * Render one stderr line for a tool-call progress event, or `null` if the
+ * event is not a tool call. Length-capped and secret-redacted with the exact
+ * same helpers `lib/protocol.mjs` itself uses for its own diagnostics
+ * (`capDiagText`/`redactSecrets`) — capping BEFORE redaction, same order as
+ * `explainProtocolError`, so a pathological argument can never reach the
+ * regex at more than {@link MAX_TOOL_ARG_DISPLAY_LENGTH} characters.
+ *
+ * Confirmed against a live, logged-in app-server (see docs/zcode-protocol-recon.md-
+ * style recon: driving a turn that calls Read/Bash/Edit and dumping every
+ * `model.streaming` kind seen) that `kind: "tool_call"` is the one event that
+ * carries both `toolName` and the fully-assembled `input` object in a single
+ * message — see `lib/session.mjs`'s `toProgressEvent` for why the earlier
+ * `tool_input_start`/`tool_input_delta`/`tool_input_end` stream is not used
+ * instead.
+ * @param {any} event a progress event from `runTurn`'s `onProgress`
+ * @returns {string | null}
+ */
+export function formatToolCallLine(event) {
+  if (!event || event.type !== "model.streaming" || event.kind !== "tool_call" || !event.toolName) return null;
+  const summary = redactSecrets(capDiagText(summarizeToolCallInput(event.input), MAX_TOOL_ARG_DISPLAY_LENGTH));
+  return summary ? `[zcode] tool: ${event.toolName} ${summary}` : `[zcode] tool: ${event.toolName}`;
+}
+
 /**
  * Progress forwarder for `runTurn`'s `onProgress` — streams model text as it
- * arrives and announces state transitions, both to stderr so stdout stays
- * exactly the final response (pipeable, per the unit-4 spec).
+ * arrives, announces state transitions, and (new) prints one line per tool
+ * call, all to stderr so stdout stays exactly the final response (pipeable,
+ * per the unit-4 spec). `--quiet` (see `handleCode`/`handleReview`) makes
+ * this a no-op entirely — the final `renderTurnFooter` summary is unaffected,
+ * since that is printed separately, after `runTurn` resolves.
+ *
+ * The streamed-text branch is now restricted to `text_delta`/`reasoning_delta`
+ * — the model's own natural-language output — rather than forwarding every
+ * non-empty `delta` unconditionally as the previous version did. That
+ * previous version also happened to forward `tool_input_delta`'s raw,
+ * unredacted, uncapped partial-JSON fragments (a tool call's arguments,
+ * streaming character-by-character) straight to stderr; excluding it here is
+ * both the fix for that and a prerequisite for the tool-call line below
+ * (which reports the same information once, safely, from `tool_call` instead).
  * @param {(text: string) => void} write
+ * @param {{ quiet?: boolean }} [options]
  */
-function makeOnProgress(write) {
+function makeOnProgress(write, { quiet = false } = {}) {
+  if (quiet) return () => {};
   return (event) => {
-    if (event.type === "model.streaming" && typeof event.delta === "string" && event.delta) {
-      write(event.delta);
+    if (event.type === "model.streaming") {
+      if ((event.kind === "text_delta" || event.kind === "reasoning_delta") && typeof event.delta === "string" && event.delta) {
+        write(event.delta);
+      } else if (event.kind === "tool_call") {
+        const line = formatToolCallLine(event);
+        if (line) write(`\n${line}\n`);
+      }
     } else if (event.type === "state.updated" && event.reason) {
       write(`\n[zcode] ${event.reason}\n`);
     }
@@ -420,20 +558,22 @@ async function handleStatus(argv, deps, log) {
 async function handleCode(argv, deps, log, logError) {
   const { resolveZcodeCli: resolveCli, runTurn: runTurnFn } = resolveDeps(deps);
   const { options, positionals } = parseCompanionArgs(argv, {
-    valueOptions: ["cwd", "model", "timeout"],
-    booleanOptions: [],
+    valueOptions: ["cwd", "model", "timeout", "mode"],
+    booleanOptions: ["quiet"],
   });
 
   const task = positionals.join(" ").trim();
   if (!task) {
     throw new UsageError(
-      "Usage: zcode-companion code <task description> [--model <id>] [--cwd <path>] [--timeout <seconds>]",
+      "Usage: zcode-companion code <task description> [--model <id>] [--cwd <path>] " +
+        `[--timeout <seconds>] [--mode <${ZCODE_MODES.join("|")}>] [--quiet]`,
     );
   }
 
   const cwd = resolveCwd(options);
   const model = parseModelFlag(options.model) ?? DEFAULT_CODE_MODEL;
   const timeoutMs = parseTimeoutFlag(options.timeout) ?? DEFAULT_CODE_TIMEOUT_SECONDS * 1000;
+  const mode = parseModeFlag(options.mode) ?? undefined;
   const cli = resolveCli();
   const prompt = buildCodePrompt({ task, cwd });
 
@@ -444,8 +584,9 @@ async function handleCode(argv, deps, log, logError) {
       workspace: workspaceRef(cwd),
       prompt,
       model,
+      mode,
       timeoutMs,
-      onProgress: makeOnProgress(logError),
+      onProgress: makeOnProgress(logError, { quiet: Boolean(options.quiet) }),
       // `runTurn`'s own default is "deny" (see lib/session.mjs) — a library
       // must not silently grant permissions. This call site opts into
       // "allow" deliberately: `code` exists to delegate actual file edits,
@@ -454,6 +595,14 @@ async function handleCode(argv, deps, log, logError) {
       // defect this fix closes — see the module doc comment above). The
       // owner accepted this because `code` always runs inside a git
       // repository, where any write it makes can be reviewed and reverted.
+      // NOTE: this is unconditional — `--mode` (above) does not change it.
+      // `--mode` is ZCode's own agent-behavior mode; permissionPolicy is this
+      // plugin's own decision about whether to auto-answer ZCode's
+      // permission prompts. See ZCODE_MODES's doc comment for why these must
+      // not be conflated — e.g. `--mode plan` still runs with
+      // permissionPolicy: "allow", it is ZCode's own plan-mode behavior
+      // (propose without touching files) that keeps it from writing, not a
+      // denial from this plugin.
       permissionPolicy: "allow",
     });
   } catch (err) {
@@ -468,8 +617,8 @@ async function handleCode(argv, deps, log, logError) {
 async function handleReview(argv, deps, log, logError) {
   const { resolveZcodeCli: resolveCli, runTurn: runTurnFn, buildReviewDiff: buildDiff } = resolveDeps(deps);
   const { options, positionals } = parseCompanionArgs(argv, {
-    valueOptions: ["cwd", "model", "timeout"],
-    booleanOptions: [],
+    valueOptions: ["cwd", "model", "timeout", "mode"],
+    booleanOptions: ["quiet"],
   });
 
   const target = positionals.join(" ").trim() || null;
@@ -480,6 +629,7 @@ async function handleReview(argv, deps, log, logError) {
 
   const model = parseModelFlag(options.model) ?? DEFAULT_REVIEW_MODEL;
   const timeoutMs = parseTimeoutFlag(options.timeout) ?? DEFAULT_REVIEW_TIMEOUT_SECONDS * 1000;
+  const mode = parseModeFlag(options.mode) ?? undefined;
   const cli = resolveCli();
   const prompt = buildReviewPrompt({ diffInfo, cwd });
 
@@ -490,13 +640,15 @@ async function handleReview(argv, deps, log, logError) {
       workspace: workspaceRef(cwd),
       prompt,
       model,
+      mode,
       timeoutMs,
-      onProgress: makeOnProgress(logError),
+      onProgress: makeOnProgress(logError, { quiet: Boolean(options.quiet) }),
       // Same reasoning as `handleCode` above: `runTurn`'s default is "deny",
       // and `review` opts into "allow" too. A review needs to actually use
       // its tools to read the surrounding files a diff touches — denying
       // every permission request breaks that the same way, and just as
       // silently (resultType stays "success" while every read is refused).
+      // Unaffected by `--mode` — see the matching note in `handleCode`.
       permissionPolicy: "allow",
     });
   } catch (err) {
