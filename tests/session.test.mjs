@@ -745,3 +745,133 @@ describe("runTurn — interaction/requestUserInput (headless, no human to answer
     assert.equal(result.response, "handled without a human");
   });
 });
+
+// --- Issue #4: tool-call fallback chain coverage ---
+// The fixture's tool-call-* scenarios each emit a single tool_call event
+// using one alternative field form. These tests verify that
+// lib/session.mjs's toProgressEvent normalizes every form to the canonical
+// field names. Removing any chain (e.g. `?? payload.id`) makes the
+// corresponding test fail — zero coverage without them.
+describe("runTurn — tool-call fallback chains", () => {
+  test("tool-call-id: payload.id is used when toolCallId is absent", async () => {
+    const progressEvents = [];
+    const result = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("tool-call-id"),
+      prompt: "hi",
+      onProgress: (event) => progressEvents.push(event),
+    });
+    assert.equal(result.resultType, "completed");
+
+    const ev = progressEvents.find((e) => e.type === "model.streaming" && e.kind === "tool_call");
+    assert.ok(ev, "tool_call event must be emitted");
+    assert.equal(ev.toolCallId, "call_id_form");
+    assert.equal(ev.toolName, "Bash");
+    assert.deepEqual(ev.input, { command: "echo id-form" });
+  });
+
+  test("tool-call-name: payload.name is used when toolName is absent", async () => {
+    const progressEvents = [];
+    const result = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("tool-call-name"),
+      prompt: "hi",
+      onProgress: (event) => progressEvents.push(event),
+    });
+    assert.equal(result.resultType, "completed");
+
+    const ev = progressEvents.find((e) => e.type === "model.streaming" && e.kind === "tool_call");
+    assert.ok(ev, "tool_call event must be emitted");
+    assert.equal(ev.toolCallId, "call_name_form");
+    assert.equal(ev.toolName, "Read");
+    assert.deepEqual(ev.input, { file_path: "/src/test.js" });
+  });
+
+  test("tool-call-tool: payload.tool is used when toolName and name are absent", async () => {
+    const progressEvents = [];
+    const result = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("tool-call-tool"),
+      prompt: "hi",
+      onProgress: (event) => progressEvents.push(event),
+    });
+    assert.equal(result.resultType, "completed");
+
+    const ev = progressEvents.find((e) => e.type === "model.streaming" && e.kind === "tool_call");
+    assert.ok(ev, "tool_call event must be emitted");
+    assert.equal(ev.toolCallId, "call_tool_form");
+    assert.equal(ev.toolName, "Glob");
+    assert.deepEqual(ev.input, { pattern: "*.js" });
+  });
+
+  test("tool-call-arguments: payload.arguments is used when input is absent", async () => {
+    const progressEvents = [];
+    const result = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("tool-call-arguments"),
+      prompt: "hi",
+      onProgress: (event) => progressEvents.push(event),
+    });
+    assert.equal(result.resultType, "completed");
+
+    const ev = progressEvents.find((e) => e.type === "model.streaming" && e.kind === "tool_call");
+    assert.ok(ev, "tool_call event must be emitted");
+    assert.equal(ev.toolCallId, "call_arguments_form");
+    assert.equal(ev.toolName, "Bash");
+    assert.deepEqual(ev.input, { command: "echo arguments" });
+  });
+
+  test("tool-call-args: payload.args is used when input and arguments are absent", async () => {
+    const progressEvents = [];
+    const result = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("tool-call-args"),
+      prompt: "hi",
+      onProgress: (event) => progressEvents.push(event),
+    });
+    assert.equal(result.resultType, "completed");
+
+    const ev = progressEvents.find((e) => e.type === "model.streaming" && e.kind === "tool_call");
+    assert.ok(ev, "tool_call event must be emitted");
+    assert.equal(ev.toolCallId, "call_args_form");
+    assert.equal(ev.toolName, "Bash");
+    assert.deepEqual(ev.input, { command: "echo args" });
+  });
+
+  test("tool-call-params: payload.params is used when all other input keys are absent", async () => {
+    const progressEvents = [];
+    const result = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("tool-call-params"),
+      prompt: "hi",
+      onProgress: (event) => progressEvents.push(event),
+    });
+    assert.equal(result.resultType, "completed");
+
+    const ev = progressEvents.find((e) => e.type === "model.streaming" && e.kind === "tool_call");
+    assert.ok(ev, "tool_call event must be emitted");
+    assert.equal(ev.toolCallId, "call_params_form");
+    assert.equal(ev.toolName, "Bash");
+    assert.deepEqual(ev.input, { command: "echo params" });
+  });
+
+  // Issue #5: a tool_call event with no tool-name field at all must still
+  // surface as a visible fallback line (not silently dropped).
+  test("tool-call-no-name: tool_call without any name key surfaces toolName as undefined", async () => {
+    const progressEvents = [];
+    const result = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("tool-call-no-name"),
+      prompt: "hi",
+      onProgress: (event) => progressEvents.push(event),
+    });
+    assert.equal(result.resultType, "completed");
+
+    const ev = progressEvents.find((e) => e.type === "model.streaming" && e.kind === "tool_call");
+    assert.ok(ev, "tool_call event must be emitted even without a name");
+    // All three name keys are absent → toolName is undefined (not "null").
+    assert.equal(ev.toolName, undefined);
+    assert.equal(ev.toolCallId, "call_no_name_form");
+    assert.deepEqual(ev.input, { command: "echo no-name" });
+  });
+});

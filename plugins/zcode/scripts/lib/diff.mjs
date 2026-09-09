@@ -11,6 +11,18 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+
+/** Default timeout for a single `git` invocation via `spawnSync`, in milliseconds. */
+const DEFAULT_GIT_TIMEOUT_MS = 30_000;
+
+/**
+ * Known ZCode service directories whose files are hook/runtime artifacts, not
+ * model-written output. Filtered from the changes summary so they never mask
+ * the changes that actually matter. Add new directories here as ZCode
+ * introduces them.
+ */
+export const ZCODE_SERVICE_DIRS = [".mimosa"];
 
 /**
  * @typedef {{
@@ -27,16 +39,46 @@ import { spawnSync } from "node:child_process";
 /**
  * @param {string} cwd
  * @param {string[]} args
- * @returns {{ status: number | null, stdout: string, stderr: string, error?: NodeJS.ErrnoException }}
+ * @param {{ timeoutMs?: number }} [options]
+ * @returns {{ status: number | null, stdout: string, stderr: string, error?: Error, signal?: NodeJS.Signals }}
  */
-function git(cwd, args) {
-  const result = spawnSync("git", args, { cwd, encoding: "utf8" });
+function git(cwd, args, options = {}) {
+  const timeoutMs = options.timeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
+  const result = spawnSync("git", args, {
+    cwd,
+    encoding: "utf8",
+    timeout: timeoutMs,
+    maxBuffer: 10 * 1024 * 1024,
+  });
+  let error = result.error;
+  if (result.signal) {
+    // spawnSync killed the process (timeout, signal) — fabricate an Error
+    // so callers that check result.error see a consistent failure shape.
+    error = error ?? new Error(`git ${args.join(" ")} killed by signal ${result.signal} after ${timeoutMs}ms`);
+  }
   return {
     status: result.status,
     stdout: result.stdout ?? "",
     stderr: result.stderr ?? "",
-    error: result.error,
+    error,
+    signal: result.signal,
   };
+}
+
+/**
+ * Whether a repo-relative path lives under a known ZCode service directory
+ * (e.g. `.mimosa/hook-state/...`) and should be excluded from the changes
+ * summary.
+ * @param {string} relPath
+ * @returns {boolean}
+ */
+function isZcodeServicePath(relPath) {
+  for (const dir of ZCODE_SERVICE_DIRS) {
+    if (relPath === dir || relPath.startsWith(dir + "/") || relPath.startsWith(dir + path.sep)) {
+      return true;
+    }
+  }
+  return false;
 }
 
 function splitLines(text) {
@@ -190,3 +232,238 @@ export function buildReviewDiff(cwd, target = null) {
 
   return { repoRoot, branch, label, diff, stat, untracked, target: target ?? null };
 }
+
+/**
+ * Compute sha256 hash of a file on disk, or null if file doesn't exist / is a directory / cannot be read.
+ * @param {string} absPath
+ * @returns {string | null}
+ */
+export function hashFile(absPath) {
+  try {
+    if (!fs.existsSync(absPath) || fs.statSync(absPath).isDirectory()) return null;
+    return createHash("sha256").update(fs.readFileSync(absPath)).digest("hex");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Capture a snapshot of git repository status and file hashes before a turn.
+ * @param {string} cwd
+ * @returns {{ isGit: boolean, repoRoot?: string, files?: Map<string, { status: string, hash: string | null }>, headCommit?: string | null }}
+ */
+export function captureGitSnapshot(cwd) {
+  if (!fs.existsSync(cwd)) {
+    return { isGit: false };
+  }
+  const check = git(cwd, ["rev-parse", "--show-toplevel"]);
+  if (check.status !== 0 || !check.stdout.trim()) {
+    return { isGit: false };
+  }
+  const repoRoot = check.stdout.trim();
+  const statusRes = git(repoRoot, ["status", "--porcelain=v1", "-z", "-uall"]);
+  const files = new Map();
+
+  if (statusRes.status === 0 && statusRes.stdout) {
+    // `-z` makes git NUL-terminate each entry and emit paths verbatim
+    // (no octal-escape quoting), so Cyrillic and other non-ASCII filenames
+    // arrive raw. For renames/copies (R/C in either status position) the
+    // -z format appends a second NUL-terminated path: the SOURCE path,
+    // i.e. `XY newpath\0oldpath\0` — so both the old and new path must be
+    // recorded so diffGitSnapshots can report the rename as a delete+create.
+    const parts = statusRes.stdout.split("\0");
+    let i = 0;
+    while (i < parts.length) {
+      const entry = parts[i];
+      if (!entry) {
+        i++;
+        continue;
+      }
+      const status = entry.slice(0, 2);
+      const firstPath = entry.slice(3); // after "XY "
+      if (!firstPath) {
+        i++;
+        continue;
+      }
+
+      const isRename = status.includes("R") || status.includes("C");
+      if (isRename && i + 1 < parts.length && parts[i + 1]) {
+        // Rename: firstPath is the destination (new) path, parts[i+1] is source (old).
+        files.set(firstPath, { status, hash: hashFile(path.resolve(repoRoot, firstPath)) });
+        files.set(parts[i + 1], { status, hash: null });
+        i += 2;
+      } else {
+        files.set(firstPath, { status, hash: hashFile(path.resolve(repoRoot, firstPath)) });
+        i += 1;
+      }
+    }
+  }
+
+  const headRes = git(repoRoot, ["rev-parse", "--verify", "HEAD"]);
+  const headCommit = headRes.status === 0 ? headRes.stdout.trim() : null;
+
+  return { isGit: true, repoRoot, files, headCommit };
+}
+
+/**
+ * Compare before snapshot with current git state to find what actually changed during the turn.
+ * @param {ReturnType<typeof captureGitSnapshot>} before
+ * @param {string} cwd
+ * @returns {{ isGit: boolean, changes: Array<{ path: string, kind: "created" | "modified" | "deleted" }> }}
+ */
+export function diffGitSnapshots(before, cwd) {
+  if (!before || !before.isGit) {
+    return { isGit: false, changes: [] };
+  }
+
+  const after = captureGitSnapshot(cwd);
+  if (!after.isGit) {
+    return { isGit: false, changes: [] };
+  }
+
+  const repoRoot = after.repoRoot;
+  const changes = [];
+  const allRelPaths = new Set([...(before.files?.keys() ?? []), ...(after.files?.keys() ?? [])]);
+  const committedChanges = new Map();
+
+  if (before.headCommit && after.headCommit && before.headCommit !== after.headCommit) {
+    // Use -M (rename detection) and -z (NUL-separated, raw paths) so that:
+    //  - committed renames show as `Rxxx\0old\0new\0` instead of two
+    //    separate D/A lines, letting us record both the old and new path;
+    //  - non-ASCII paths (Cyrillic, etc.) arrive raw, not octal-escaped.
+    const commitDiff = git(repoRoot, ["diff", "-M", "--name-status", "-z", `${before.headCommit}..${after.headCommit}`]);
+    if (commitDiff.status === 0 && commitDiff.stdout) {
+      const parts = commitDiff.stdout.split("\0");
+      let i = 0;
+      while (i < parts.length) {
+        const statusCode = parts[i];
+        if (!statusCode) {
+          i++;
+          continue;
+        }
+        const isRename = statusCode.startsWith("R") || statusCode.startsWith("C");
+        if (isRename && i + 2 < parts.length && parts[i + 1] && parts[i + 2]) {
+          // -z rename entry: status\0old\0new — old path is the source.
+          const oldPath = parts[i + 1];
+          const newPath = parts[i + 2];
+          committedChanges.set(oldPath, "D");
+          committedChanges.set(newPath, "A");
+          allRelPaths.add(oldPath);
+          allRelPaths.add(newPath);
+          i += 3;
+        } else if (i + 1 < parts.length) {
+          const relPath = parts[i + 1];
+          if (relPath) {
+            committedChanges.set(relPath, statusCode);
+            allRelPaths.add(relPath);
+          }
+          i += 2;
+        } else {
+          i++;
+        }
+      }
+    }
+  }
+
+  for (const relPath of allRelPaths) {
+    if (isZcodeServicePath(relPath)) continue;
+
+    const b = before.files?.get(relPath);
+    const a = after.files?.get(relPath);
+    const absPath = path.resolve(repoRoot, relPath);
+    let existsNow = false;
+    try {
+      existsNow = fs.existsSync(absPath) && !fs.statSync(absPath).isDirectory();
+    } catch {
+      // Race or permission error between existsSync and statSync — treat as
+      // non-existent rather than crashing the summary.
+      existsNow = false;
+    }
+    const currentHash = hashFile(absPath);
+
+    let displayPath = relPath;
+    if (cwd) {
+      const resolvedCwd = path.resolve(cwd);
+      let realCwd = resolvedCwd;
+      let realAbs = absPath;
+      try {
+        if (fs.existsSync(resolvedCwd)) realCwd = fs.realpathSync(resolvedCwd);
+        if (fs.existsSync(absPath)) realAbs = fs.realpathSync(absPath);
+      } catch {}
+      const relToCwd = path.relative(realCwd, realAbs);
+      if (!relToCwd.startsWith("..") && !path.isAbsolute(relToCwd)) {
+        displayPath = relToCwd || ".";
+      }
+    }
+
+    if (!b && a) {
+      if (!existsNow || a.status.includes("D")) {
+        changes.push({ path: displayPath, kind: "deleted" });
+      } else if (a.status === "??" || a.status.includes("A") || a.status.includes("R") || a.status.includes("C")) {
+        changes.push({ path: displayPath, kind: "created" });
+      } else {
+        changes.push({ path: displayPath, kind: "modified" });
+      }
+    } else if (b && a) {
+      if (b.hash !== currentHash) {
+        if (!existsNow) {
+          changes.push({ path: displayPath, kind: "deleted" });
+        } else if (b.hash === null) {
+          changes.push({ path: displayPath, kind: "created" });
+        } else {
+          changes.push({ path: displayPath, kind: "modified" });
+        }
+      }
+    } else if (b && !a) {
+      const cStatus = committedChanges.get(relPath);
+      if (cStatus && cStatus.startsWith("D")) {
+        changes.push({ path: displayPath, kind: "deleted" });
+      } else if (!existsNow) {
+        changes.push({ path: displayPath, kind: "deleted" });
+      } else if (b.status === "??" && cStatus && cStatus.startsWith("A")) {
+        changes.push({ path: displayPath, kind: "created" });
+      } else if (b.hash !== currentHash) {
+        changes.push({ path: displayPath, kind: "modified" });
+      }
+    } else if (!b && !a && committedChanges.has(relPath)) {
+      const cStatus = committedChanges.get(relPath);
+      if (cStatus && (cStatus.startsWith("D") || !existsNow)) {
+        changes.push({ path: displayPath, kind: "deleted" });
+      } else if (cStatus && cStatus.startsWith("A")) {
+        changes.push({ path: displayPath, kind: "created" });
+      } else {
+        changes.push({ path: displayPath, kind: "modified" });
+      }
+    }
+  }
+
+  changes.sort((x, y) => x.path.localeCompare(y.path));
+  return { isGit: true, changes };
+}
+
+/**
+ * Render the human-readable summary of changed files for stderr.
+ * @param {{ isGit: boolean, changes?: Array<{ path: string, kind: "created" | "modified" | "deleted" }> }} diffResult
+ * @returns {string}
+ */
+export function renderChangesSummary(diffResult) {
+  if (!diffResult) return "";
+  if (!diffResult.isGit) {
+    return "[zcode] сводка изменений недоступна вне git-репозитория\n";
+  }
+  if (!diffResult.changes || diffResult.changes.length === 0) {
+    return "[zcode] изменённые файлы: (нет изменений)\n";
+  }
+  const lines = ["[zcode] изменённые файлы:"];
+  const labels = {
+    created: "создан",
+    modified: "изменён",
+    deleted: "удалён",
+  };
+  for (const item of diffResult.changes) {
+    const label = labels[item.kind] ?? item.kind;
+    lines.push(`[zcode]   ${item.path} (${label})`);
+  }
+  return lines.join("\n") + "\n";
+}
+

@@ -13,14 +13,17 @@ import { after, describe, test } from "node:test";
 
 import { parseArgs, splitRawArgumentString } from "../plugins/zcode/scripts/lib/args.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "../plugins/zcode/scripts/lib/prompts.mjs";
-import { buildReviewDiff } from "../plugins/zcode/scripts/lib/diff.mjs";
+import { buildReviewDiff, captureGitSnapshot, diffGitSnapshots, renderChangesSummary } from "../plugins/zcode/scripts/lib/diff.mjs";
 import {
   runCli,
   parseModelFlag,
   parseTimeoutFlag,
   parseModeFlag,
   formatToolCallLine,
+  formatDisplayPath,
+  summarizeToolCallInput,
   formatHeartbeatLine,
+  makeOnProgress,
   buildCodePrompt,
   buildReviewPrompt,
   ZCODE_MODES,
@@ -353,7 +356,21 @@ describe("formatToolCallLine", () => {
     assert.equal(formatToolCallLine(null), null);
     assert.equal(formatToolCallLine({ type: "state.updated", reason: "prompt_started" }), null);
     assert.equal(formatToolCallLine({ type: "model.streaming", kind: "text_delta", delta: "hi" }), null);
-    assert.equal(formatToolCallLine({ type: "model.streaming", kind: "tool_call" }), null); // no toolName
+  });
+
+  test("falls back to a visible placeholder when toolName is missing", () => {
+    const line = formatToolCallLine({ type: "model.streaming", kind: "tool_call" });
+    assert.equal(line, "[zcode] tool: (неизвестный инструмент)");
+  });
+
+  test("fallback line includes extracted input when toolName is missing", () => {
+    const line = formatToolCallLine({
+      type: "model.streaming",
+      kind: "tool_call",
+      input: { command: "ls -la" },
+    });
+    assert.match(line, /\(неизвестный инструмент\)/);
+    assert.match(line, /ls -la/);
   });
 
   test("prefers a known argument field (file_path) as the summary", () => {
@@ -416,6 +433,47 @@ describe("formatToolCallLine", () => {
     });
     assert.doesNotMatch(line, /sk-super-secret-value/);
     assert.match(line, /"apiKey":"\[REDACTED\]"/);
+  });
+
+  test("relativizes path within cwd", () => {
+    const cwd = "/Users/testuser/project";
+    const line = formatToolCallLine(
+      {
+        type: "model.streaming",
+        kind: "tool_call",
+        toolName: "Write",
+        input: { file_path: "/Users/testuser/project/src/index.mjs" },
+      },
+      cwd,
+    );
+    assert.equal(line, "[zcode] tool: Write src/index.mjs");
+  });
+
+  test("shortens path outside cwd under home directory to ~", () => {
+    const cwd = "/Users/testuser/project";
+    const homedir = "/Users/testuser";
+    const formatted = formatDisplayPath("/Users/testuser/.zcode/config.json", cwd, homedir);
+    assert.equal(formatted, "~/.zcode/config.json");
+  });
+
+  test("leaves path outside cwd and home directory as absolute", () => {
+    const cwd = "/Users/testuser/project";
+    const homedir = "/Users/testuser";
+    const formatted = formatDisplayPath("/etc/hosts", cwd, homedir);
+    assert.equal(formatted, "/etc/hosts");
+  });
+
+  test("supports alternative input field names (filePath, file, filename, skill, name)", () => {
+    assert.equal(summarizeToolCallInput({ filePath: "/repo/a.js" }, "/repo"), "a.js");
+    assert.equal(summarizeToolCallInput({ file: "/repo/b.js" }, "/repo"), "b.js");
+    assert.equal(summarizeToolCallInput({ filename: "/repo/c.js" }, "/repo"), "c.js");
+    assert.equal(summarizeToolCallInput({ skill: "code-review" }), "code-review");
+    assert.equal(summarizeToolCallInput({ name: "my-skill" }), "my-skill");
+  });
+
+  test("parses stringified JSON input object", () => {
+    const jsonInput = JSON.stringify({ file_path: "/repo/main.mjs" });
+    assert.equal(summarizeToolCallInput(jsonInput, "/repo"), "main.mjs");
   });
 });
 
@@ -1118,5 +1176,212 @@ describe("runCli — code / review success and failure paths (runTurn stubbed)",
     // 2700 * 1.5 = 4050 — NOT 5400 (a blind doubling).
     assert.match(sinks.stderr(), /--timeout 4050\b/);
     assert.doesNotMatch(sinks.stderr(), /--timeout 5400\b/);
+  });
+});
+
+describe("makeOnProgress — progress callback and flags", () => {
+  test("emits distinct lines for multiple sequential tool calls", () => {
+    const lines = [];
+    const onProgress = makeOnProgress((text) => lines.push(text), { cwd: "/repo" });
+    onProgress({
+      type: "model.streaming",
+      kind: "tool_call",
+      toolName: "Write",
+      input: { file_path: "/repo/a.txt" },
+    });
+    onProgress({
+      type: "model.streaming",
+      kind: "tool_call",
+      toolName: "Write",
+      input: { file_path: "/repo/b.txt" },
+    });
+    onProgress({
+      type: "model.streaming",
+      kind: "tool_call",
+      toolName: "Bash",
+      input: { command: "ls -la" },
+    });
+
+    const combined = lines.join("");
+    assert.match(combined, /tool: Write a\.txt/);
+    assert.match(combined, /tool: Write b\.txt/);
+    assert.match(combined, /tool: Bash ls -la/);
+  });
+
+  test("noStream suppresses text_delta and reasoning_delta but preserves tool calls and heartbeats", () => {
+    const lines = [];
+    const onProgress = makeOnProgress((text) => lines.push(text), { noStream: true, cwd: "/repo" });
+    onProgress({ type: "model.streaming", kind: "reasoning_delta", delta: "secret thoughts" });
+    onProgress({ type: "model.streaming", kind: "text_delta", delta: "streamed response" });
+    onProgress({
+      type: "model.streaming",
+      kind: "tool_call",
+      toolName: "Write",
+      input: { file_path: "/repo/a.txt" },
+    });
+    onProgress({
+      type: "heartbeat",
+      elapsedMs: 60_000,
+      alive: true,
+      stalled: false,
+      modelRequestCount: 2,
+      totalTokens: 1000,
+    });
+
+    const combined = lines.join("");
+    assert.doesNotMatch(combined, /secret thoughts/);
+    assert.doesNotMatch(combined, /streamed response/);
+    assert.match(combined, /tool: Write a\.txt/);
+    assert.match(combined, /жив/);
+  });
+});
+
+describe("git snapshot diffing and file changes summary", () => {
+  test("diffGitSnapshots detects created, modified, and deleted files", () => {
+    const repo = makeGitRepo();
+    // Initially tracked.txt is committed. Let's create an untracked file to begin with.
+    fs.writeFileSync(path.join(repo, "dirty-before.txt"), "untouched during turn\n");
+    const before = captureGitSnapshot(repo);
+
+    // During the turn: create a new file, modify tracked.txt, delete another file
+    fs.writeFileSync(path.join(repo, "created.txt"), "hello\n");
+    fs.writeFileSync(path.join(repo, "tracked.txt"), "modified content\n");
+
+    const diff = diffGitSnapshots(before, repo);
+    assert.equal(diff.isGit, true);
+
+    const created = diff.changes.find((c) => c.path === "created.txt");
+    const modified = diff.changes.find((c) => c.path === "tracked.txt");
+    const dirtyBefore = diff.changes.find((c) => c.path === "dirty-before.txt");
+
+    assert.ok(created, "created.txt should be in diff changes");
+    assert.equal(created.kind, "created");
+
+    assert.ok(modified, "tracked.txt should be in diff changes");
+    assert.equal(modified.kind, "modified");
+
+    assert.equal(dirtyBefore, undefined, "pre-existing dirty file untouched during turn must not appear");
+  });
+
+  test("diffGitSnapshots detects deleted files", () => {
+    const repo = makeGitRepo();
+    const before = captureGitSnapshot(repo);
+    fs.rmSync(path.join(repo, "tracked.txt"));
+
+    const diff = diffGitSnapshots(before, repo);
+    const deleted = diff.changes.find((c) => c.path === "tracked.txt");
+    assert.ok(deleted, "tracked.txt deletion should be detected");
+    assert.equal(deleted.kind, "deleted");
+  });
+
+  test("renderChangesSummary formats created/modified/deleted list correctly", () => {
+    const summary = renderChangesSummary({
+      isGit: true,
+      changes: [
+        { path: "src/slug.mjs", kind: "created" },
+        { path: "tests/slug.test.mjs", kind: "modified" },
+        { path: "old.txt", kind: "deleted" },
+      ],
+    });
+
+    assert.match(summary, /\[zcode\] изменённые файлы:/);
+    assert.match(summary, /\[zcode\]   src\/slug\.mjs \(создан\)/);
+    assert.match(summary, /\[zcode\]   tests\/slug\.test\.mjs \(изменён\)/);
+    assert.match(summary, /\[zcode\]   old\.txt \(удалён\)/);
+  });
+
+  test("renderChangesSummary handles empty changes and non-git repos", () => {
+    assert.equal(
+      renderChangesSummary({ isGit: true, changes: [] }),
+      "[zcode] изменённые файлы: (нет изменений)\n",
+    );
+    assert.equal(
+      renderChangesSummary({ isGit: false, changes: [] }),
+      "[zcode] сводка изменений недоступна вне git-репозитория\n",
+    );
+  });
+
+  test("`code` command in git repo prints file changes summary in stderr", async () => {
+    const repo = makeGitRepo();
+    const sinks = makeSinks();
+    const code = await runCli(["code", "create", "a", "file", "--cwd", repo], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async () => {
+        fs.writeFileSync(path.join(repo, "generated.js"), "console.log('hi');\n");
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.equal(code, EXIT_OK);
+    assert.match(sinks.stderr(), /\[zcode\] изменённые файлы:/);
+    assert.match(sinks.stderr(), /generated\.js \(создан\)/);
+  });
+
+  test("`code --quiet` suppresses both per-step progress and file changes summary", async () => {
+    const repo = makeGitRepo();
+    const sinks = makeSinks();
+    const code = await runCli(["code", "create", "a", "file", "--cwd", repo, "--quiet"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async () => {
+        fs.writeFileSync(path.join(repo, "generated2.js"), "console.log('hi');\n");
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.equal(code, EXIT_OK);
+    assert.doesNotMatch(sinks.stderr(), /изменённые файлы:/);
+    assert.doesNotMatch(sinks.stderr(), /generated2\.js/);
+    assert.match(sinks.stderr(), /turn usage:/);
+  });
+
+  test("`code --no-stream` keeps tool calls and changes summary while suppressing streaming deltas", async () => {
+    const repo = makeGitRepo();
+    const sinks = makeSinks();
+    const code = await runCli(["code", "create", "a", "file", "--cwd", repo, "--no-stream"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({ type: "model.streaming", kind: "reasoning_delta", delta: "thinking hard" });
+        args.onProgress({ type: "model.streaming", kind: "text_delta", delta: "streaming text" });
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_call",
+          toolName: "Write",
+          input: { file_path: path.join(repo, "streamed-tool.js") },
+        });
+        fs.writeFileSync(path.join(repo, "streamed-tool.js"), "export const x = 1;\n");
+        return {
+          sessionId: "s1",
+          response: "done creating file",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.equal(code, EXIT_OK);
+    assert.doesNotMatch(sinks.stderr(), /thinking hard/);
+    assert.doesNotMatch(sinks.stderr(), /streaming text/);
+    assert.match(sinks.stderr(), /tool: Write streamed-tool\.js/);
+    assert.match(sinks.stderr(), /\[zcode\] изменённые файлы:/);
+    assert.match(sinks.stderr(), /streamed-tool\.js \(создан\)/);
   });
 });

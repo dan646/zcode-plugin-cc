@@ -20,13 +20,15 @@
  * secret-redaction/length-cap approach instead of inventing a second one,
  * per the same reasoning as `explainProtocolError`'s use of them.
  */
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { buildReviewDiff } from "./lib/diff.mjs";
+import { buildReviewDiff, captureGitSnapshot, diffGitSnapshots, renderChangesSummary } from "./lib/diff.mjs";
 import { resolveZcodeCli, workspaceRef } from "./lib/locate.mjs";
 import { runTurn, readWorkspaceState, isProviderConfigured, formatDurationMs } from "./lib/session.mjs";
 import { redactSecrets, capDiagText } from "./lib/protocol.mjs";
@@ -128,8 +130,11 @@ Common options:
                             without touching files, "edit" restricts it to editing existing files,
                             "yolo" skips its own internal confirmations, "build" is its default.
                             Defaults to whatever ZCode's own session default is when omitted.
-  --quiet                   Suppress per-step progress on stderr (state changes, tool calls);
-                            print only the final response/summary (code/review only)
+  --quiet                   Suppress per-step progress and summary on stderr (state changes,
+                            tool calls, streaming text); print only the final response/footer
+                            (code/review only)
+  --no-stream               Suppress only streaming model text on stderr; keep tool calls,
+                            heartbeats, and changes summary intact (code/review only)
 `;
 
 /** Thrown for bad CLI usage (missing/invalid arguments) — always maps to {@link EXIT_ERROR}. */
@@ -332,23 +337,115 @@ function toActionableTimeoutError(err, timeoutMs) {
 // `pattern`, WebFetch's `url`). Falls back to the whole `input` object
 // (JSON-stringified) for any tool this list does not name, rather than
 // showing nothing for it.
-const TOOL_CALL_ARG_FIELDS = ["file_path", "path", "notebook_path", "command", "pattern", "url", "query"];
+const PATH_FIELDS = ["file_path", "filePath", "file", "filename", "path", "notebook_path"];
+const TOOL_CALL_ARG_FIELDS = [
+  "file_path",
+  "filePath",
+  "file",
+  "filename",
+  "path",
+  "notebook_path",
+  "command",
+  "pattern",
+  "query",
+  "url",
+  "skill",
+  "name",
+];
 
 /** Hard cap on a tool-call progress line's argument summary — a long file
  * path or shell command must not make one line dominate the whole stream. */
 const MAX_TOOL_ARG_DISPLAY_LENGTH = 160;
 
 /**
+ * Format an absolute or home-relative path relative to `cwd`, shortening paths
+ * outside `cwd` that are under the user's home directory to `~/...`.
+ * @param {string} targetPath
+ * @param {string} [cwd]
+ * @param {string} [homedir]
+ * @returns {string}
+ */
+export function formatDisplayPath(targetPath, cwd = process.cwd(), homedir = os.homedir()) {
+  if (typeof targetPath !== "string" || !targetPath.trim()) return targetPath;
+  const raw = targetPath.trim();
+
+  // Only expand bare `~` and `~/...` — NOT `~user/...` (which `path.join`
+  // would garble by treating `user` as a literal path segment under homedir).
+  const expanded = raw === "~" ? homedir : raw.startsWith("~/") ? path.join(homedir, raw.slice(2)) : raw;
+  if (!path.isAbsolute(expanded)) {
+    return raw;
+  }
+
+  const canonicalize = (p) => {
+    let abs = path.resolve(p);
+    try {
+      if (fs.existsSync(abs)) {
+        return fs.realpathSync(abs);
+      }
+      let cur = abs;
+      const unshifted = [];
+      while (cur && cur !== path.dirname(cur)) {
+        unshifted.unshift(path.basename(cur));
+        cur = path.dirname(cur);
+        if (fs.existsSync(cur)) {
+          return path.join(fs.realpathSync(cur), ...unshifted);
+        }
+      }
+    } catch {}
+    if (abs.startsWith("/private/var/")) abs = "/var/" + abs.slice("/private/var/".length);
+    else if (abs.startsWith("/private/tmp/")) abs = "/tmp/" + abs.slice("/private/tmp/".length);
+    return abs;
+  };
+
+  const resolvedTarget = canonicalize(expanded);
+  const resolvedCwd = canonicalize(cwd);
+  const resolvedHome = canonicalize(homedir);
+
+  const relToCwd = path.relative(resolvedCwd, resolvedTarget);
+  if (relToCwd === "") return ".";
+  if (!relToCwd.startsWith("..") && !path.isAbsolute(relToCwd)) {
+    return relToCwd;
+  }
+
+  const relToHome = path.relative(resolvedHome, resolvedTarget);
+  if (relToHome === "") return "~";
+  if (!relToHome.startsWith("..") && !path.isAbsolute(relToHome)) {
+    return `~/${relToHome}`;
+  }
+
+  return raw;
+}
+
+/**
  * Build the one-line, human-scannable argument summary for a tool-call
  * progress event (see {@link TOOL_CALL_ARG_FIELDS}).
  * @param {unknown} input `event.input` from a `kind: "tool_call"` progress event
+ * @param {string} [cwd]
  * @returns {string} possibly empty
  */
-function summarizeToolCallInput(input) {
-  if (!input || typeof input !== "object") return "";
-  const knownField = TOOL_CALL_ARG_FIELDS.find((field) => typeof input[field] === "string" && input[field]);
-  if (knownField) return input[knownField];
-  return Object.keys(input).length > 0 ? JSON.stringify(input) : "";
+export function summarizeToolCallInput(input, cwd = process.cwd()) {
+  if (!input) return "";
+  let obj = input;
+  if (typeof input === "string") {
+    try {
+      const parsed = JSON.parse(input);
+      if (parsed && typeof parsed === "object") obj = parsed;
+      else return input;
+    } catch {
+      return input;
+    }
+  }
+  if (typeof obj !== "object") return String(obj);
+
+  const knownField = TOOL_CALL_ARG_FIELDS.find((field) => typeof obj[field] === "string" && obj[field]);
+  if (knownField) {
+    const val = obj[knownField];
+    if (PATH_FIELDS.includes(knownField)) {
+      return formatDisplayPath(val, cwd);
+    }
+    return val;
+  }
+  return Object.keys(obj).length > 0 ? JSON.stringify(obj) : "";
 }
 
 /**
@@ -367,12 +464,19 @@ function summarizeToolCallInput(input) {
  * `tool_input_start`/`tool_input_delta`/`tool_input_end` stream is not used
  * instead.
  * @param {any} event a progress event from `runTurn`'s `onProgress`
+ * @param {string} [cwd]
  * @returns {string | null}
  */
-export function formatToolCallLine(event) {
-  if (!event || event.type !== "model.streaming" || event.kind !== "tool_call" || !event.toolName) return null;
-  const summary = redactSecrets(capDiagText(summarizeToolCallInput(event.input), MAX_TOOL_ARG_DISPLAY_LENGTH));
-  return summary ? `[zcode] tool: ${event.toolName} ${summary}` : `[zcode] tool: ${event.toolName}`;
+export function formatToolCallLine(event, cwd = process.cwd()) {
+  if (!event || event.type !== "model.streaming" || event.kind !== "tool_call") return null;
+  // When no tool-name key survived the chain in lib/session.mjs's
+  // toProgressEvent (payload.toolName ?? payload.name ?? payload.tool),
+  // emit a visible fallback line instead of silently dropping it — the
+  // "exactly one line per tool call" guarantee means the missing name must
+  // be observable, not invisible.
+  const toolName = event.toolName || "(неизвестный инструмент)";
+  const summary = redactSecrets(capDiagText(summarizeToolCallInput(event.input, cwd), MAX_TOOL_ARG_DISPLAY_LENGTH));
+  return summary ? `[zcode] tool: ${toolName} ${summary}` : `[zcode] tool: ${toolName}`;
 }
 
 /**
@@ -447,32 +551,26 @@ export function formatHeartbeatLine(event) {
 /**
  * Progress forwarder for `runTurn`'s `onProgress` — streams model text as it
  * arrives, announces state transitions, prints one line per tool call, and
- * (new) one compact line per `heartbeat` self-check event (see
- * `formatHeartbeatLine` above) — all to stderr so stdout stays exactly the
- * final response (pipeable, per the unit-4 spec). `--quiet` (see
- * `handleCode`/`handleReview`) makes this a no-op entirely — the final
- * `renderTurnFooter` summary is unaffected, since that is printed separately,
- * after `runTurn` resolves.
+ * one compact line per `heartbeat` self-check event (see `formatHeartbeatLine`
+ * above) — all to stderr so stdout stays exactly the final response.
  *
- * The streamed-text branch is now restricted to `text_delta`/`reasoning_delta`
- * — the model's own natural-language output — rather than forwarding every
- * non-empty `delta` unconditionally as the previous version did. That
- * previous version also happened to forward `tool_input_delta`'s raw,
- * unredacted, uncapped partial-JSON fragments (a tool call's arguments,
- * streaming character-by-character) straight to stderr; excluding it here is
- * both the fix for that and a prerequisite for the tool-call line below
- * (which reports the same information once, safely, from `tool_call` instead).
+ * `--quiet` suppresses all line-by-line progress entirely.
+ * `--no-stream` suppresses only streamed model text deltas (natural-language
+ * reasoning/response output), while keeping tool calls, heartbeats, and
+ * state notifications visible.
  * @param {(text: string) => void} write
- * @param {{ quiet?: boolean }} [options]
+ * @param {{ quiet?: boolean, noStream?: boolean, cwd?: string }} [options]
  */
-function makeOnProgress(write, { quiet = false } = {}) {
+export function makeOnProgress(write, { quiet = false, noStream = false, cwd = process.cwd() } = {}) {
   if (quiet) return () => {};
   return (event) => {
     if (event.type === "model.streaming") {
       if ((event.kind === "text_delta" || event.kind === "reasoning_delta") && typeof event.delta === "string" && event.delta) {
-        write(event.delta);
+        if (!noStream) {
+          write(event.delta);
+        }
       } else if (event.kind === "tool_call") {
-        const line = formatToolCallLine(event);
+        const line = formatToolCallLine(event, cwd);
         if (line) write(`\n${line}\n`);
       }
     } else if (event.type === "state.updated" && event.reason) {
@@ -519,6 +617,9 @@ function resolveDeps(deps) {
     readWorkspaceState: deps.readWorkspaceState ?? readWorkspaceState,
     runTurn: deps.runTurn ?? runTurn,
     buildReviewDiff: deps.buildReviewDiff ?? buildReviewDiff,
+    captureGitSnapshot: deps.captureGitSnapshot ?? captureGitSnapshot,
+    diffGitSnapshots: deps.diffGitSnapshots ?? diffGitSnapshots,
+    renderChangesSummary: deps.renderChangesSummary ?? renderChangesSummary,
   };
 }
 
@@ -664,18 +765,46 @@ async function handleStatus(argv, deps, log) {
   return EXIT_OK;
 }
 
+/**
+ * Safely render and print the changes summary to stderr. Any error during
+ * snapshot diffing — a git timeout, a race on fs.stat, an EPERM — is caught
+ * and reported as a single "сводка недоступна" line; it never propagates
+ * to change the turn's exit code (requirement 3: the summary is decoration,
+ * never a success/failure signal).
+ * @param {ReturnType<typeof captureGitSnapshot> | null} gitSnapshot
+ * @param {string} cwd
+ * @param {(text: string) => void} logError
+ * @param {(before: any, cwd: string) => any} diffSnapshots
+ * @param {(diffResult: any) => string} renderSummary
+ */
+function printChangesSummary(gitSnapshot, cwd, logError, diffSnapshots, renderSummary) {
+  if (!gitSnapshot) return;
+  try {
+    const diffResult = diffSnapshots(gitSnapshot, cwd);
+    logError(renderSummary(diffResult));
+  } catch (err) {
+    logError(`[zcode] сводка недоступна: ${err?.message ?? String(err)}\n`);
+  }
+}
+
 async function handleCode(argv, deps, log, logError) {
-  const { resolveZcodeCli: resolveCli, runTurn: runTurnFn } = resolveDeps(deps);
+  const {
+    resolveZcodeCli: resolveCli,
+    runTurn: runTurnFn,
+    captureGitSnapshot: captureSnapshot,
+    diffGitSnapshots: diffSnapshots,
+    renderChangesSummary: renderSummary,
+  } = resolveDeps(deps);
   const { options, positionals } = parseCompanionArgs(argv, {
     valueOptions: ["cwd", "model", "timeout", "mode"],
-    booleanOptions: ["quiet"],
+    booleanOptions: ["quiet", "no-stream"],
   });
 
   const task = positionals.join(" ").trim();
   if (!task) {
     throw new UsageError(
       "Usage: zcode-companion code <task description> [--model <id>] [--cwd <path>] " +
-        `[--timeout <seconds>] [--mode <${ZCODE_MODES.join("|")}>] [--quiet]`,
+        `[--timeout <seconds>] [--mode <${ZCODE_MODES.join("|")}>] [--quiet] [--no-stream]`,
     );
   }
 
@@ -686,6 +815,11 @@ async function handleCode(argv, deps, log, logError) {
   const cli = resolveCli();
   const prompt = buildCodePrompt({ task, cwd });
 
+  // --quiet suppresses per-step progress AND the changes summary — so don't
+  // bother capturing the git snapshot at all (avoiding wasteful git spawns).
+  const isQuiet = Boolean(options.quiet);
+  const gitSnapshot = isQuiet ? null : captureSnapshot(cwd);
+
   let result;
   try {
     result = await runTurnFn({
@@ -695,7 +829,11 @@ async function handleCode(argv, deps, log, logError) {
       model,
       mode,
       timeoutMs,
-      onProgress: makeOnProgress(logError, { quiet: Boolean(options.quiet) }),
+      onProgress: makeOnProgress(logError, {
+        quiet: Boolean(options.quiet),
+        noStream: Boolean(options["no-stream"]),
+        cwd,
+      }),
       // `runTurn`'s own default is "deny" (see lib/session.mjs) — a library
       // must not silently grant permissions. This call site opts into
       // "allow" deliberately: `code` exists to delegate actual file edits,
@@ -715,19 +853,37 @@ async function handleCode(argv, deps, log, logError) {
       permissionPolicy: "allow",
     });
   } catch (err) {
+    // Requirement 3: summarize first (best-effort, never changes exit code),
+    // then re-throw so runCli()'s catch block sets the right exit code.
+    // Requirement 7: print the summary even on turn failure — the model may
+    // have written files before the turn failed, and that is exactly when
+    // the summary is most useful.
+    if (!isQuiet) {
+      printChangesSummary(gitSnapshot, cwd, logError, diffSnapshots, renderSummary);
+    }
     throw isRunTurnTimeout(err) ? toActionableTimeoutError(err, timeoutMs) : err;
   }
 
   log((typeof result.response === "string" ? result.response : JSON.stringify(result.response, null, 2)) + "\n");
   logError(renderTurnFooter(result));
+  if (!isQuiet) {
+    printChangesSummary(gitSnapshot, cwd, logError, diffSnapshots, renderSummary);
+  }
   return EXIT_OK;
 }
 
 async function handleReview(argv, deps, log, logError) {
-  const { resolveZcodeCli: resolveCli, runTurn: runTurnFn, buildReviewDiff: buildDiff } = resolveDeps(deps);
+  const {
+    resolveZcodeCli: resolveCli,
+    runTurn: runTurnFn,
+    buildReviewDiff: buildDiff,
+    captureGitSnapshot: captureSnapshot,
+    diffGitSnapshots: diffSnapshots,
+    renderChangesSummary: renderSummary,
+  } = resolveDeps(deps);
   const { options, positionals } = parseCompanionArgs(argv, {
     valueOptions: ["cwd", "model", "timeout", "mode"],
-    booleanOptions: ["quiet"],
+    booleanOptions: ["quiet", "no-stream"],
   });
 
   const target = positionals.join(" ").trim() || null;
@@ -742,6 +898,11 @@ async function handleReview(argv, deps, log, logError) {
   const cli = resolveCli();
   const prompt = buildReviewPrompt({ diffInfo, cwd });
 
+  // --quiet suppresses per-step progress AND the changes summary — so don't
+  // bother capturing the git snapshot at all.
+  const isQuiet = Boolean(options.quiet);
+  const gitSnapshot = isQuiet ? null : captureSnapshot(cwd);
+
   let result;
   try {
     result = await runTurnFn({
@@ -751,7 +912,11 @@ async function handleReview(argv, deps, log, logError) {
       model,
       mode,
       timeoutMs,
-      onProgress: makeOnProgress(logError, { quiet: Boolean(options.quiet) }),
+      onProgress: makeOnProgress(logError, {
+        quiet: Boolean(options.quiet),
+        noStream: Boolean(options["no-stream"]),
+        cwd,
+      }),
       // Same reasoning as `handleCode` above: `runTurn`'s default is "deny",
       // and `review` opts into "allow" too. A review needs to actually use
       // its tools to read the surrounding files a diff touches — denying
@@ -761,11 +926,19 @@ async function handleReview(argv, deps, log, logError) {
       permissionPolicy: "allow",
     });
   } catch (err) {
+    // Requirement 3 & 7: best-effort summary on failure (never changes exit
+    // code), then re-throw so runCli() sets the right exit code.
+    if (!isQuiet) {
+      printChangesSummary(gitSnapshot, cwd, logError, diffSnapshots, renderSummary);
+    }
     throw isRunTurnTimeout(err) ? toActionableTimeoutError(err, timeoutMs) : err;
   }
 
   log((typeof result.response === "string" ? result.response : JSON.stringify(result.response, null, 2)) + "\n");
   logError(renderTurnFooter(result));
+  if (!isQuiet) {
+    printChangesSummary(gitSnapshot, cwd, logError, diffSnapshots, renderSummary);
+  }
   return EXIT_OK;
 }
 
@@ -779,6 +952,9 @@ async function handleReview(argv, deps, log, logError) {
  *   readWorkspaceState?: typeof readWorkspaceState,
  *   runTurn?: typeof runTurn,
  *   buildReviewDiff?: typeof buildReviewDiff,
+ *   captureGitSnapshot?: typeof captureGitSnapshot,
+ *   diffGitSnapshots?: typeof diffGitSnapshots,
+ *   renderChangesSummary?: typeof renderChangesSummary,
  *   log?: (text: string) => void,
  *   logError?: (text: string) => void,
  * }} [deps]

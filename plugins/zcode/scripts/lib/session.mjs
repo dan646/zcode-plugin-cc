@@ -456,9 +456,9 @@ function toProgressEvent(type, params) {
   // `text_delta`/`reasoning_delta`, pinned by an exact `deepEqual` in
   // tests/session.test.mjs) is completely unaffected.
   if (payload.kind === "tool_call") {
-    event.toolCallId = payload.toolCallId;
-    event.toolName = payload.toolName;
-    event.input = payload.input;
+    event.toolCallId = payload.toolCallId ?? payload.id;
+    event.toolName = payload.toolName ?? payload.name ?? payload.tool;
+    event.input = payload.input ?? payload.arguments ?? payload.args ?? payload.params;
   }
 
   return event;

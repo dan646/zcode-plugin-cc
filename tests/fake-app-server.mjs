@@ -253,6 +253,39 @@ function scheduleTurnEvents(sessionId, scenario, getScopesSeen) {
     );
   }
 
+  // --- Issue #4: alternative field forms for tool-call progress events ---
+  // Each scenario emits one `kind: "tool_call"` event using a single
+  // alternative field name instead of the canonical one, so tests can verify
+  // that lib/session.mjs's fallback chains (toolCallId ?? id, toolName ??
+  // name ?? tool, input ?? arguments ?? args ?? params) normalize every form.
+  // Removing any chain makes the corresponding test fail.
+  if (scenario.startsWith("tool-call-")) {
+    const form = scenario.slice("tool-call-".length);
+    const altPayloads = {
+      id: { id: "call_id_form", toolName: "Bash", input: { command: "echo id-form" } },
+      name: { toolCallId: "call_name_form", name: "Read", input: { file_path: "/src/test.js" } },
+      tool: { toolCallId: "call_tool_form", tool: "Glob", input: { pattern: "*.js" } },
+      arguments: { toolCallId: "call_arguments_form", toolName: "Bash", arguments: { command: "echo arguments" } },
+      args: { toolCallId: "call_args_form", toolName: "Bash", args: { command: "echo args" } },
+      params: { toolCallId: "call_params_form", toolName: "Bash", params: { command: "echo params" } },
+      "no-name": { toolCallId: "call_no_name_form", input: { command: "echo no-name" } },
+    };
+    const fields = altPayloads[form];
+    if (fields) {
+      setTimeout(
+        () =>
+          emitEvent(sessionId, "model.streaming", {
+            assistantMessageId: "m1",
+            delta: "",
+            done: false,
+            kind: "tool_call",
+            ...fields,
+          }),
+        17,
+      );
+    }
+  }
+
   if (scenario === "failure") {
     setTimeout(
       () =>
