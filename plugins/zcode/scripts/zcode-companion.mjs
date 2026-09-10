@@ -28,7 +28,15 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 
 import { parseArgs, splitRawArgumentString } from "./lib/args.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "./lib/prompts.mjs";
-import { buildReviewDiff, captureGitSnapshot, diffGitSnapshots, renderChangesSummary } from "./lib/diff.mjs";
+import {
+  buildReviewDiff,
+  captureGitSnapshot,
+  createFileJournal,
+  diffGitSnapshots,
+  renderChangesSummary,
+  renderJournaledChangesSummary,
+} from "./lib/diff.mjs";
+import { formatDisplayPath } from "./lib/paths.mjs";
 import { resolveZcodeCli, workspaceRef } from "./lib/locate.mjs";
 import { runTurn, readWorkspaceState, isProviderConfigured, formatDurationMs } from "./lib/session.mjs";
 import { redactSecrets, capDiagText } from "./lib/protocol.mjs";
@@ -358,65 +366,6 @@ const TOOL_CALL_ARG_FIELDS = [
 const MAX_TOOL_ARG_DISPLAY_LENGTH = 160;
 
 /**
- * Format an absolute or home-relative path relative to `cwd`, shortening paths
- * outside `cwd` that are under the user's home directory to `~/...`.
- * @param {string} targetPath
- * @param {string} [cwd]
- * @param {string} [homedir]
- * @returns {string}
- */
-export function formatDisplayPath(targetPath, cwd = process.cwd(), homedir = os.homedir()) {
-  if (typeof targetPath !== "string" || !targetPath.trim()) return targetPath;
-  const raw = targetPath.trim();
-
-  // Only expand bare `~` and `~/...` — NOT `~user/...` (which `path.join`
-  // would garble by treating `user` as a literal path segment under homedir).
-  const expanded = raw === "~" ? homedir : raw.startsWith("~/") ? path.join(homedir, raw.slice(2)) : raw;
-  if (!path.isAbsolute(expanded)) {
-    return raw;
-  }
-
-  const canonicalize = (p) => {
-    let abs = path.resolve(p);
-    try {
-      if (fs.existsSync(abs)) {
-        return fs.realpathSync(abs);
-      }
-      let cur = abs;
-      const unshifted = [];
-      while (cur && cur !== path.dirname(cur)) {
-        unshifted.unshift(path.basename(cur));
-        cur = path.dirname(cur);
-        if (fs.existsSync(cur)) {
-          return path.join(fs.realpathSync(cur), ...unshifted);
-        }
-      }
-    } catch {}
-    if (abs.startsWith("/private/var/")) abs = "/var/" + abs.slice("/private/var/".length);
-    else if (abs.startsWith("/private/tmp/")) abs = "/tmp/" + abs.slice("/private/tmp/".length);
-    return abs;
-  };
-
-  const resolvedTarget = canonicalize(expanded);
-  const resolvedCwd = canonicalize(cwd);
-  const resolvedHome = canonicalize(homedir);
-
-  const relToCwd = path.relative(resolvedCwd, resolvedTarget);
-  if (relToCwd === "") return ".";
-  if (!relToCwd.startsWith("..") && !path.isAbsolute(relToCwd)) {
-    return relToCwd;
-  }
-
-  const relToHome = path.relative(resolvedHome, resolvedTarget);
-  if (relToHome === "") return "~";
-  if (!relToHome.startsWith("..") && !path.isAbsolute(relToHome)) {
-    return `~/${relToHome}`;
-  }
-
-  return raw;
-}
-
-/**
  * Build the one-line, human-scannable argument summary for a tool-call
  * progress event (see {@link TOOL_CALL_ARG_FIELDS}).
  * @param {unknown} input `event.input` from a `kind: "tool_call"` progress event
@@ -558,11 +507,21 @@ export function formatHeartbeatLine(event) {
  * `--no-stream` suppresses only streamed model text deltas (natural-language
  * reasoning/response output), while keeping tool calls, heartbeats, and
  * state notifications visible.
+ *
+ * When a `journal` is supplied, every `tool_call` event is recorded into it
+ * (file-writing tools by path, Bash commands by text) for the post-turn
+ * two-part changes summary. Recording is skipped when there is no journal
+ * (i.e. under `--quiet`) — no point building a summary that won't be printed.
  * @param {(text: string) => void} write
- * @param {{ quiet?: boolean, noStream?: boolean, cwd?: string }} [options]
+ * @param {{ quiet?: boolean, noStream?: boolean, cwd?: string, journal?: import("./lib/diff.mjs").ReturnType<typeof createFileJournal> | null }} [options]
  */
-export function makeOnProgress(write, { quiet = false, noStream = false, cwd = process.cwd() } = {}) {
+export function makeOnProgress(write, { quiet = false, noStream = false, cwd = process.cwd(), journal = null } = {}) {
   if (quiet) return () => {};
+  // Track the last printed model/mode pair so we don't emit the same startup
+  // line twice — the server frequently sends two identical `state.updated`
+  // events (e.g. "model=glm-5.3-flash mode=build" at turn start), which would
+  // otherwise print the line twice on stderr.
+  let lastStateKey = null;
   return (event) => {
     if (event.type === "model.streaming") {
       if ((event.kind === "text_delta" || event.kind === "reasoning_delta") && typeof event.delta === "string" && event.delta) {
@@ -570,11 +529,33 @@ export function makeOnProgress(write, { quiet = false, noStream = false, cwd = p
           write(event.delta);
         }
       } else if (event.kind === "tool_call") {
+        if (journal) journal.recordToolCall(event.toolName, event.input);
         const line = formatToolCallLine(event, cwd);
         if (line) write(`\n${line}\n`);
       }
-    } else if (event.type === "state.updated" && event.reason) {
-      write(`\n[zcode] ${event.reason}\n`);
+    } else if (event.type === "state.updated") {
+      // Prefer showing concrete values (model id / mode) from the patch over
+      // the bare reason string — "model_changed" says nothing a user can act
+      // on, "model=glm-5.3-flash" does. Print nothing when there is no value.
+      //
+      // Only accept string values: a non-string (object) model/mode would
+      // serialize as "[object Object]" on stderr. Secrets are handled by
+      // `redactSecrets`, same helper `formatToolCallLine` reuses.
+      const modelId = event.patch?.model?.current?.modelId;
+      const mode = event.patch?.mode?.current;
+      const safeModel = typeof modelId === "string" && modelId ? modelId : null;
+      const safeMode = typeof mode === "string" && mode ? mode : null;
+      if (safeModel || safeMode) {
+        const key = `${safeModel ?? ""}::${safeMode ?? ""}`;
+        if (key === lastStateKey) return;
+        lastStateKey = key;
+        const parts = [];
+        if (safeModel) parts.push(`model=${safeModel}`);
+        if (safeMode) parts.push(`mode=${safeMode}`);
+        write(`\n${redactSecrets(`[zcode] ${parts.join(" ")}`)}\n`);
+      } else if (event.reason) {
+        write(`\n${redactSecrets(`[zcode] ${event.reason}`)}\n`);
+      }
     } else if (event.type === "heartbeat") {
       const line = formatHeartbeatLine(event);
       if (line) write(`\n${line}\n`);
@@ -618,8 +599,10 @@ function resolveDeps(deps) {
     runTurn: deps.runTurn ?? runTurn,
     buildReviewDiff: deps.buildReviewDiff ?? buildReviewDiff,
     captureGitSnapshot: deps.captureGitSnapshot ?? captureGitSnapshot,
+    createFileJournal: deps.createFileJournal ?? createFileJournal,
     diffGitSnapshots: deps.diffGitSnapshots ?? diffGitSnapshots,
     renderChangesSummary: deps.renderChangesSummary ?? renderChangesSummary,
+    renderJournaledChangesSummary: deps.renderJournaledChangesSummary ?? renderJournaledChangesSummary,
   };
 }
 
@@ -771,17 +754,24 @@ async function handleStatus(argv, deps, log) {
  * and reported as a single "сводка недоступна" line; it never propagates
  * to change the turn's exit code (requirement 3: the summary is decoration,
  * never a success/failure signal).
+ *
+ * The two-part renderer (`renderJournaledChangesSummary`) splits the git diff
+ * into "files this run wrote" (from the journal) and "everything else that
+ * changed in the repo meanwhile" — the fix for parallel-edit false positives.
+ * The legacy single-part renderer (`renderChangesSummary`) is kept as a
+ * fallback for callers that don't pass a journal.
  * @param {ReturnType<typeof captureGitSnapshot> | null} gitSnapshot
  * @param {string} cwd
+ * @param {{ writtenFiles?: Iterable<string>, bashCommands?: string[] } | null} journal
  * @param {(text: string) => void} logError
  * @param {(before: any, cwd: string) => any} diffSnapshots
- * @param {(diffResult: any) => string} renderSummary
+ * @param {(diffResult: any, journal: any, cwd: string) => string} renderSummary
  */
-function printChangesSummary(gitSnapshot, cwd, logError, diffSnapshots, renderSummary) {
+function printChangesSummary(gitSnapshot, cwd, journal, logError, diffSnapshots, renderSummary) {
   if (!gitSnapshot) return;
   try {
     const diffResult = diffSnapshots(gitSnapshot, cwd);
-    logError(renderSummary(diffResult));
+    logError(renderSummary(diffResult, journal, cwd));
   } catch (err) {
     logError(`[zcode] сводка недоступна: ${err?.message ?? String(err)}\n`);
   }
@@ -792,8 +782,9 @@ async function handleCode(argv, deps, log, logError) {
     resolveZcodeCli: resolveCli,
     runTurn: runTurnFn,
     captureGitSnapshot: captureSnapshot,
+    createFileJournal: createJournal,
     diffGitSnapshots: diffSnapshots,
-    renderChangesSummary: renderSummary,
+    renderJournaledChangesSummary: renderSummary,
   } = resolveDeps(deps);
   const { options, positionals } = parseCompanionArgs(argv, {
     valueOptions: ["cwd", "model", "timeout", "mode"],
@@ -816,9 +807,11 @@ async function handleCode(argv, deps, log, logError) {
   const prompt = buildCodePrompt({ task, cwd });
 
   // --quiet suppresses per-step progress AND the changes summary — so don't
-  // bother capturing the git snapshot at all (avoiding wasteful git spawns).
+  // bother capturing the git snapshot or building the journal at all
+  // (avoiding wasteful work for a summary that won't be printed).
   const isQuiet = Boolean(options.quiet);
   const gitSnapshot = isQuiet ? null : captureSnapshot(cwd);
+  const journal = isQuiet ? null : createJournal(cwd);
 
   let result;
   try {
@@ -833,6 +826,7 @@ async function handleCode(argv, deps, log, logError) {
         quiet: Boolean(options.quiet),
         noStream: Boolean(options["no-stream"]),
         cwd,
+        journal,
       }),
       // `runTurn`'s own default is "deny" (see lib/session.mjs) — a library
       // must not silently grant permissions. This call site opts into
@@ -859,7 +853,7 @@ async function handleCode(argv, deps, log, logError) {
     // have written files before the turn failed, and that is exactly when
     // the summary is most useful.
     if (!isQuiet) {
-      printChangesSummary(gitSnapshot, cwd, logError, diffSnapshots, renderSummary);
+      printChangesSummary(gitSnapshot, cwd, journal, logError, diffSnapshots, renderSummary);
     }
     throw isRunTurnTimeout(err) ? toActionableTimeoutError(err, timeoutMs) : err;
   }
@@ -867,7 +861,7 @@ async function handleCode(argv, deps, log, logError) {
   log((typeof result.response === "string" ? result.response : JSON.stringify(result.response, null, 2)) + "\n");
   logError(renderTurnFooter(result));
   if (!isQuiet) {
-    printChangesSummary(gitSnapshot, cwd, logError, diffSnapshots, renderSummary);
+    printChangesSummary(gitSnapshot, cwd, journal, logError, diffSnapshots, renderSummary);
   }
   return EXIT_OK;
 }
@@ -878,8 +872,9 @@ async function handleReview(argv, deps, log, logError) {
     runTurn: runTurnFn,
     buildReviewDiff: buildDiff,
     captureGitSnapshot: captureSnapshot,
+    createFileJournal: createJournal,
     diffGitSnapshots: diffSnapshots,
-    renderChangesSummary: renderSummary,
+    renderJournaledChangesSummary: renderSummary,
   } = resolveDeps(deps);
   const { options, positionals } = parseCompanionArgs(argv, {
     valueOptions: ["cwd", "model", "timeout", "mode"],
@@ -899,9 +894,10 @@ async function handleReview(argv, deps, log, logError) {
   const prompt = buildReviewPrompt({ diffInfo, cwd });
 
   // --quiet suppresses per-step progress AND the changes summary — so don't
-  // bother capturing the git snapshot at all.
+  // bother capturing the git snapshot or building the journal at all.
   const isQuiet = Boolean(options.quiet);
   const gitSnapshot = isQuiet ? null : captureSnapshot(cwd);
+  const journal = isQuiet ? null : createJournal(cwd);
 
   let result;
   try {
@@ -916,6 +912,7 @@ async function handleReview(argv, deps, log, logError) {
         quiet: Boolean(options.quiet),
         noStream: Boolean(options["no-stream"]),
         cwd,
+        journal,
       }),
       // Same reasoning as `handleCode` above: `runTurn`'s default is "deny",
       // and `review` opts into "allow" too. A review needs to actually use
@@ -929,7 +926,7 @@ async function handleReview(argv, deps, log, logError) {
     // Requirement 3 & 7: best-effort summary on failure (never changes exit
     // code), then re-throw so runCli() sets the right exit code.
     if (!isQuiet) {
-      printChangesSummary(gitSnapshot, cwd, logError, diffSnapshots, renderSummary);
+      printChangesSummary(gitSnapshot, cwd, journal, logError, diffSnapshots, renderSummary);
     }
     throw isRunTurnTimeout(err) ? toActionableTimeoutError(err, timeoutMs) : err;
   }
@@ -937,7 +934,7 @@ async function handleReview(argv, deps, log, logError) {
   log((typeof result.response === "string" ? result.response : JSON.stringify(result.response, null, 2)) + "\n");
   logError(renderTurnFooter(result));
   if (!isQuiet) {
-    printChangesSummary(gitSnapshot, cwd, logError, diffSnapshots, renderSummary);
+    printChangesSummary(gitSnapshot, cwd, journal, logError, diffSnapshots, renderSummary);
   }
   return EXIT_OK;
 }
@@ -953,8 +950,10 @@ async function handleReview(argv, deps, log, logError) {
  *   runTurn?: typeof runTurn,
  *   buildReviewDiff?: typeof buildReviewDiff,
  *   captureGitSnapshot?: typeof captureGitSnapshot,
+ *   createFileJournal?: typeof createFileJournal,
  *   diffGitSnapshots?: typeof diffGitSnapshots,
  *   renderChangesSummary?: typeof renderChangesSummary,
+ *   renderJournaledChangesSummary?: typeof renderJournaledChangesSummary,
  *   log?: (text: string) => void,
  *   logError?: (text: string) => void,
  * }} [deps]

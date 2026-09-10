@@ -12,6 +12,7 @@ import fs from "node:fs";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import { createHash } from "node:crypto";
+import { canonicalizePath, formatDisplayPath } from "./paths.mjs";
 
 /** Default timeout for a single `git` invocation via `spawnSync`, in milliseconds. */
 const DEFAULT_GIT_TIMEOUT_MS = 30_000;
@@ -23,6 +24,59 @@ const DEFAULT_GIT_TIMEOUT_MS = 30_000;
  * introduces them.
  */
 export const ZCODE_SERVICE_DIRS = [".mimosa"];
+
+/**
+ * Tool names empirically confirmed (against a live, logged-in ZCode
+ * app-server) to write file contents and to carry the target path in
+ * `input.file_path`:
+ *   - "Write": creates or overwrites a file (`input: {file_path, content}`).
+ *   - "Edit": replaces a span in an existing file
+ *     (`input: {file_path, old_string, new_string}`).
+ * "Read" also carries `file_path` but is read-only — deliberately excluded.
+ * Extend this list only after observing a new writer's toolName + file_path
+ * on a real turn; do not guess.
+ */
+export const FILE_WRITING_TOOLS = Object.freeze(["Write", "Edit"]);
+
+/**
+ * Create a per-turn journal of which files THIS run wrote (via file-writing
+ * tools) and which shell commands it ran (via Bash). Fed incrementally by
+ * `recordToolCall` from `makeOnProgress`'s `tool_call` events; consumed by
+ * `renderJournaledChangesSummary` after the turn to split the changes summary
+ * into "written by this run" vs "everything else".
+ *
+ * Paths are stored absolute (resolved against `cwd`) so they survive cwd
+ * changes and match against git's repo-relative display paths via
+ * `resolveDisplayPath`. `cwd` is the run's working directory (`--cwd`), NOT
+ * `process.cwd()` — the two differ when the companion is launched from
+ * outside the target repo, and resolving against the wrong one makes this
+ * run's own writes land in the "not by this run" part of the summary.
+ * @param {string} cwd absolute working directory of the run
+ * @returns {{
+ *   writtenFiles: Set<string>,
+ *   bashCommands: string[],
+ *   recordToolCall(toolName: string, input: any): void,
+ * }}
+ */
+export function createFileJournal(cwd = process.cwd()) {
+  const writtenFiles = new Set();
+  const bashCommands = [];
+  return {
+    writtenFiles,
+    bashCommands,
+    recordToolCall(toolName, input) {
+      if (FILE_WRITING_TOOLS.includes(toolName)) {
+        const fp = input?.file_path ?? input?.filePath;
+        if (typeof fp === "string" && fp.trim()) {
+          writtenFiles.add(path.resolve(cwd, fp));
+        }
+      } else if (toolName === "Bash") {
+        const cmd = input?.command;
+        if (typeof cmd === "string") bashCommands.push(cmd);
+      }
+    },
+  };
+}
 
 /**
  * @typedef {{
@@ -381,20 +435,13 @@ export function diffGitSnapshots(before, cwd) {
     }
     const currentHash = hashFile(absPath);
 
-    let displayPath = relPath;
-    if (cwd) {
-      const resolvedCwd = path.resolve(cwd);
-      let realCwd = resolvedCwd;
-      let realAbs = absPath;
-      try {
-        if (fs.existsSync(resolvedCwd)) realCwd = fs.realpathSync(resolvedCwd);
-        if (fs.existsSync(absPath)) realAbs = fs.realpathSync(absPath);
-      } catch {}
-      const relToCwd = path.relative(realCwd, realAbs);
-      if (!relToCwd.startsWith("..") && !path.isAbsolute(relToCwd)) {
-        displayPath = relToCwd || ".";
-      }
-    }
+    // Canonicalize both sides through the nearest existing parent so that
+    // a file the model wrote then deleted (or has not created yet) gets the
+    // same canonical form as existing ones — otherwise a `/var/...` path
+    // here vs git's `/private/var/...` would land the same file in BOTH
+    // parts of the summary. `resolveDisplayPath` also applies the shared
+    // outside-cwd `~/...` rule.
+    const displayPath = cwd ? resolveDisplayPath(absPath, cwd) : relPath;
 
     if (!b && a) {
       if (!existsNow || a.status.includes("D")) {
@@ -464,6 +511,162 @@ export function renderChangesSummary(diffResult) {
     const label = labels[item.kind] ?? item.kind;
     lines.push(`[zcode]   ${item.path} (${label})`);
   }
+  return lines.join("\n") + "\n";
+}
+
+const CHANGE_LABELS = {
+  created: "создан",
+  modified: "изменён",
+  deleted: "удалён",
+};
+
+/**
+ * Convert an absolute path to the same relative-to-cwd form that
+ * `diffGitSnapshots` uses for its `displayPath`, so journal entries and git
+ * changes can be matched by string equality. Paths inside `cwd` are shown
+ * relative to it; paths outside `cwd` that are under the home directory are
+ * shortened to `~/...` (same rule as `formatDisplayPath`).
+ *
+ * Both sides are canonicalized via `canonicalizePath` (resolves symlinks
+ * through the nearest existing parent), so a file the model wrote then
+ * deleted gets the same canonical form git uses — without this, a
+ * `/var/...` journal entry vs git's `/private/var/...` would land the file
+ * in BOTH parts of the summary.
+ * @param {string} absPath
+ * @param {string} cwd
+ * @returns {string}
+ */
+export function resolveDisplayPath(absPath, cwd) {
+  const realCwd = canonicalizePath(cwd);
+  const realAbs = canonicalizePath(absPath);
+  const rel = path.relative(realCwd, realAbs);
+  if (rel === "") return ".";
+  if (!rel.startsWith("..") && !path.isAbsolute(rel)) return rel;
+  // Outside cwd — shorten home-relative paths to `~/...` per the project's
+  // display rule (reuse the shared formatter for a single source of truth).
+  // Pass the CANONICAL forms (realAbs/realCwd) so that, when the path is
+  // outside both cwd and the home dir and the formatter returns `raw` as-is,
+  // that raw value is the canonical form — matching what git resolves — instead
+  // of leaving a raw `/var/...` (or symlink-`/tmp/...`) form that diverges
+  // from git's `/private/...` and lands the same file in BOTH summary parts.
+  return formatDisplayPath(realAbs, realCwd);
+}
+
+/**
+ * Decline the noun "команда" (command) after an Arabic numeral, per the
+ * project's Russian-language heading convention: 1 команда, 2 команды,
+ * 5 команд, 11 команд, 21 команда, 22 команды, 25 команд, 111 команд.
+ *
+ * Numbers whose last two digits are 11–14 always take the genitive plural
+ * "команд" (11 команд, 12 команд, 13 команд, 14 команд, 112 команд, 114
+ * команд, etc.) — this is the exception that last-digit-only logic misses,
+ * since 14 ends in 4 but still declines as "команд".
+ * @param {number} n
+ * @returns {"команда" | "команды" | "команд"}
+ */
+export function declineCommands(n) {
+  const tens = n % 100;
+  if (tens >= 11 && tens <= 14) return "команд";
+  const last = n % 10;
+  if (last === 1) return "команда";
+  if (last >= 2 && last <= 4) return "команды";
+  return "команд";
+}
+
+/**
+ * Build the two-part changes summary: files written by this run (from the
+ * journal) with their git kind, followed by everything git saw change that
+ * the journal does NOT account for (parallel edits or Bash side effects).
+ *
+ * The journal is the only thing that distinguishes "this run wrote it" from
+ * "something else changed it while we were running" — without it the two
+ * parts collapse back into the old single undifferentiated list.
+ *
+ * @param {{ isGit: boolean, changes?: Array<{ path: string, kind: "created" | "modified" | "deleted" }> }} diffResult
+ * @param {{ writtenFiles?: Iterable<string>, bashCommands?: string[] } | null} journal
+ * @param {string} cwd
+ * @returns {string}
+ */
+export function renderJournaledChangesSummary(diffResult, journal, cwd) {
+  const lines = [];
+
+  // Part 1: files this run recorded via file-writing tools. Kind comes from
+  // the git diff when present; "записан, без изменений" when the write left
+  // the content identical (or there is no git repo to compare against).
+  const writtenDisplayPaths = new Set();
+  if (journal) {
+    for (const absPath of journal.writtenFiles ?? []) {
+      const displayPath = resolveDisplayPath(absPath, cwd);
+      if (isZcodeServicePath(displayPath)) continue;
+      writtenDisplayPaths.add(displayPath);
+    }
+  }
+
+  const gitByPath = new Map();
+  if (diffResult?.changes) {
+    for (const c of diffResult.changes) {
+      if (!isZcodeServicePath(c.path)) gitByPath.set(c.path, c.kind);
+    }
+  }
+
+  const part1 = [];
+  for (const displayPath of [...writtenDisplayPaths].sort()) {
+    part1.push({ path: displayPath, kind: gitByPath.get(displayPath) ?? null });
+  }
+
+  // Part 2: git changes the journal does NOT explain — parallel edits by
+  // other processes, or side effects of Bash commands this run executed.
+  const part2 = [];
+  if (diffResult?.changes) {
+    for (const c of diffResult.changes) {
+      if (isZcodeServicePath(c.path)) continue;
+      if (writtenDisplayPaths.has(c.path)) continue;
+      part2.push(c);
+    }
+  }
+
+  if (part1.length > 0) {
+    lines.push("[zcode] изменено этим запуском:");
+    for (const item of part1) {
+      const label = item.kind == null ? "записан, без изменений" : CHANGE_LABELS[item.kind] ?? item.kind;
+      lines.push(`[zcode]   ${item.path} (${label})`);
+    }
+  }
+
+  const bashCount = journal?.bashCommands?.length ?? 0;
+  if (part2.length > 0) {
+    if (bashCount > 0) {
+      // At least one Bash call happened this turn, so we cannot claim these
+      // changes are "not from this run": the Bash calls themselves (or
+      // parallel edits) may have caused them. State only that the source is
+      // not established, and note the declared Bash-call count without
+      // asserting the calls actually executed or wrote anything.
+      lines.push(
+        `[zcode] изменено в репозитории за время хода, возможно параллельные правки ` +
+          `или команды Bash этого хода (источник не установлен; ${bashCount} ` +
+          `${declineCommands(bashCount)} Bash):`,
+      );
+    } else {
+      // No Bash calls this turn: the journal accounts for every writer, so the
+      // remaining git changes really are attributable to someone else.
+      lines.push("[zcode] изменено в репозитории за время хода, но не этим запуском:");
+    }
+    for (const item of part2) {
+      const label = CHANGE_LABELS[item.kind] ?? item.kind;
+      lines.push(`[zcode]   ${item.path} (${label})`);
+    }
+  }
+
+  // Outside a git repo the journal still reports what this run wrote, but the
+  // "everything else" part is unavailable — say so in one line.
+  if (diffResult && !diffResult.isGit && part1.length === 0) {
+    return "";
+  }
+  if (diffResult && !diffResult.isGit) {
+    lines.push("[zcode] сводка по репозиторию недоступна вне git-репозитория");
+  }
+
+  if (lines.length === 0) return "";
   return lines.join("\n") + "\n";
 }
 

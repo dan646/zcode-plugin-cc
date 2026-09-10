@@ -300,6 +300,37 @@ ZCode. Нижележащий Anthropic-SDK всё равно требует т�
 ошибка сменилась с «Anthropic API key is missing» на «Client signing credential must
 contain one separator», то есть значение дошло до подписи запроса.
 
+## Запросы разрешения зависят от режима сессии
+
+Проверено живым ходом с задачей «создай файл и выполни команду с перенаправлением»:
+
+| режим (`session/setMode`) | запросов `interaction/requestPermission` | файлы записаны |
+|---|---|---|
+| `build` | 2 — на `Write` и на `Bash` | да |
+| `yolo` | **0** | да |
+
+**В режиме `yolo` ZCode разрешений не спрашивает вовсе** — у клиента нет точки контроля.
+В `build` каждый вызов с побочным эффектом приходит к клиенту:
+
+```jsonc
+{ "toolName": "Write", "toolCallId": "...", "requestId": "perm_...",
+  "input": { "file_path": "/abs/path/a.txt", "content": "x" },
+  "riskLevel": "medium", "reason": "Tool has side effects and requires approval",
+  "options": [ /* allow_once, allow_project, deny — с готовыми ответами */ ] }
+
+{ "toolName": "Bash", "input": { "command": "echo hi > /abs/path/b.txt", "description": "..." },
+  "riskLevel": "high", "reason": "High risk tools require explicit approval" }
+```
+
+Выводы для плагина:
+
+- Любое ограничение области правок (`--allow`/`--deny`) реализуемо **только** в режимах со
+  спросом разрешений; в `yolo` оно невозможно в принципе, и сочетание надо отвергать.
+- Автоматическое разрешение через обработчик в `build` даёт то же поведение, что `yolo`,
+  но с сохранённой точкой контроля. Поэтому `yolo` при работе через плагин не нужен.
+- Для `Write`/`Edit` путь структурирован (`input.file_path`); для `Bash` — только текст
+  команды, из которого надёжно извлечь записываемые пути нельзя.
+
 ## Оценка уровня 2
 
 Дёшево. Транспорт тривиальный, хендшейка нет, схемы снимаются автоматически,

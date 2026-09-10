@@ -13,14 +13,23 @@ import { after, describe, test } from "node:test";
 
 import { parseArgs, splitRawArgumentString } from "../plugins/zcode/scripts/lib/args.mjs";
 import { loadPromptTemplate, interpolateTemplate } from "../plugins/zcode/scripts/lib/prompts.mjs";
-import { buildReviewDiff, captureGitSnapshot, diffGitSnapshots, renderChangesSummary } from "../plugins/zcode/scripts/lib/diff.mjs";
+import {
+  buildReviewDiff,
+  captureGitSnapshot,
+  createFileJournal,
+  declineCommands,
+  diffGitSnapshots,
+  renderChangesSummary,
+  renderJournaledChangesSummary,
+  resolveDisplayPath,
+  FILE_WRITING_TOOLS,
+} from "../plugins/zcode/scripts/lib/diff.mjs";
 import {
   runCli,
   parseModelFlag,
   parseTimeoutFlag,
   parseModeFlag,
   formatToolCallLine,
-  formatDisplayPath,
   summarizeToolCallInput,
   formatHeartbeatLine,
   makeOnProgress,
@@ -31,6 +40,7 @@ import {
   EXIT_ERROR,
   EXIT_TURN_FAILED,
 } from "../plugins/zcode/scripts/zcode-companion.mjs";
+import { formatDisplayPath, canonicalizePath } from "../plugins/zcode/scripts/lib/paths.mjs";
 
 // `fileURLToPath`, not `new URL(...).pathname` — `.pathname` is
 // percent-encoded, so a checkout path with a space or non-ASCII character
@@ -135,6 +145,68 @@ describe("splitRawArgumentString", () => {
 
   test("empty/whitespace-only input yields no tokens", () => {
     assert.deepEqual(splitRawArgumentString("   "), []);
+  });
+});
+
+// ------------------------------------------------------------- paths.mjs
+
+describe("canonicalizePath", () => {
+  // Force the fallback branch by making `fs.realpathSync` throw — on a real
+  // filesystem `/` always exists and is realpath-able, so the fallback (no
+  // existing ancestor could be resolved) is otherwise unreachable via plain
+  // paths. `fs.realpathSync` is writable on Node's `fs` default-export object,
+  // so a save/restore swap is sufficient (no external mocking dependency).
+  function withThrowingRealpath(fn) {
+    const orig = fs.realpathSync;
+    fs.realpathSync = (_p) => {
+      throw new Error("boom");
+    };
+    try {
+      return fn();
+    } finally {
+      fs.realpathSync = orig;
+    }
+  }
+
+  test("fallback branch rewrites /var,/tmp to /private/... on macOS and is a no-op elsewhere", () => {
+    withThrowingRealpath(() => {
+      if (process.platform === "darwin") {
+        // Same /private/... form that the successful fs.realpathSync branch
+        // returns — the fallback must NOT diverge the other way.
+        assert.equal(canonicalizePath("/var/foo"), "/private/var/foo");
+        assert.equal(canonicalizePath("/tmp/bar"), "/private/tmp/bar");
+        // Bare stems with no trailing segment.
+        assert.equal(canonicalizePath("/var"), "/private/var");
+        assert.equal(canonicalizePath("/tmp"), "/private/tmp");
+        // Non-/var, non-/tmp paths are returned verbatim on the fallback.
+        assert.equal(canonicalizePath("/etc/hosts"), "/etc/hosts");
+      } else {
+        // On non-darwin the fallback must apply NO /private rewrite at all.
+        assert.equal(canonicalizePath("/var/foo"), "/var/foo");
+        assert.equal(canonicalizePath("/tmp/bar"), "/tmp/bar");
+        assert.equal(canonicalizePath("/var"), "/var");
+      }
+    });
+  });
+
+  test("fallback result equals the successful-branch result for the same /var path (macOS)", () => {
+    if (process.platform !== "darwin") return; // relies on /var -> /private/var
+    const sample = "/var/folders/zz/does-not-exist-yet.txt";
+    // Successful branch: walks up to the nearest existing ancestor under
+    // /var -> /private/var and rebuilds the tail.
+    const real = canonicalizePath(sample);
+    assert.equal(real, "/private/var/folders/zz/does-not-exist-yet.txt");
+    // Fallback branch (realpathSync throws) must yield the SAME canonical form,
+    // not the raw /var/... form — that is the regression this guards.
+    withThrowingRealpath(() => {
+      assert.equal(canonicalizePath(sample), real);
+    });
+  });
+
+  test("successful branch resolves existing /var entries to /private/... (macOS)", () => {
+    if (process.platform !== "darwin") return;
+    assert.equal(canonicalizePath("/var"), "/private/var");
+    assert.equal(canonicalizePath("/tmp"), "/private/tmp");
   });
 });
 
@@ -1308,6 +1380,8 @@ describe("git snapshot diffing and file changes summary", () => {
       ...sinks,
       resolveZcodeCli: fakeResolveZcodeCli,
       runTurn: async () => {
+        // Written directly (not via a file-writing tool call) — must land in
+        // the "not by this run" part, since the journal has no record of it.
         fs.writeFileSync(path.join(repo, "generated.js"), "console.log('hi');\n");
         return {
           sessionId: "s1",
@@ -1321,7 +1395,7 @@ describe("git snapshot diffing and file changes summary", () => {
     });
 
     assert.equal(code, EXIT_OK);
-    assert.match(sinks.stderr(), /\[zcode\] изменённые файлы:/);
+    assert.match(sinks.stderr(), /\[zcode\] изменено в репозитории за время хода, но не этим запуском:/);
     assert.match(sinks.stderr(), /generated\.js \(создан\)/);
   });
 
@@ -1381,7 +1455,762 @@ describe("git snapshot diffing and file changes summary", () => {
     assert.doesNotMatch(sinks.stderr(), /thinking hard/);
     assert.doesNotMatch(sinks.stderr(), /streaming text/);
     assert.match(sinks.stderr(), /tool: Write streamed-tool\.js/);
-    assert.match(sinks.stderr(), /\[zcode\] изменённые файлы:/);
+    // Written via a `Write` tool call → recorded in the journal → part 1.
+    assert.match(sinks.stderr(), /\[zcode\] изменено этим запуском:/);
     assert.match(sinks.stderr(), /streamed-tool\.js \(создан\)/);
+  });
+});
+
+// --------------------------------------------------------- two-part summary
+//
+// These cover the parallel-edit defect fix: the changes summary must split
+// into "written by this run" (from the file-write journal) and "everything
+// else git saw change" (parallel edits, Bash side effects). All of them run
+// against a real temporary git repository — the fake-app-server fixture has
+// no git, so the git-dependent parts cannot be exercised there.
+
+describe("two-part changes summary (parallel-edit fix)", () => {
+  test("FILE_WRITING_TOOLS lists the empirically confirmed writers", () => {
+    assert.deepEqual(FILE_WRITING_TOOLS, ["Write", "Edit"]);
+  });
+
+  test("createFileJournal records Write/Edit paths and Bash commands, ignores Read", () => {
+    const journal = createFileJournal();
+    journal.recordToolCall("Write", { file_path: "/repo/a.txt", content: "x" });
+    journal.recordToolCall("Edit", { file_path: "/repo/b.txt", old_string: "a", new_string: "b" });
+    journal.recordToolCall("Read", { file_path: "/repo/c.txt" });
+    journal.recordToolCall("Bash", { command: "echo hi" });
+    journal.recordToolCall("Glob", { pattern: "*.txt" });
+
+    assert.deepEqual([...journal.writtenFiles].sort(), ["/repo/a.txt", "/repo/b.txt"]);
+    assert.deepEqual(journal.bashCommands, ["echo hi"]);
+  });
+
+  test("journal records resolved absolute paths for relative file_path", () => {
+    const journal = createFileJournal();
+    journal.recordToolCall("Write", { file_path: "relative.txt", content: "x" });
+    // path.resolve makes it absolute against cwd.
+    assert.ok([...journal.writtenFiles].every((p) => path.isAbsolute(p)));
+    assert.equal([...journal.writtenFiles].length, 1);
+  });
+
+  test("resolveDisplayPath relativizes against cwd", () => {
+    assert.equal(resolveDisplayPath("/repo/src/index.mjs", "/repo"), "src/index.mjs");
+    assert.equal(resolveDisplayPath("/repo", "/repo"), ".");
+    // Outside cwd → falls back to the absolute path.
+    assert.equal(resolveDisplayPath("/other/file.txt", "/repo"), "/other/file.txt");
+  });
+
+  test("renderJournaledChangesSummary: journal file lands in part 1 with git kind", () => {
+    const cwd = "/repo";
+    const summary = renderJournaledChangesSummary(
+      {
+        isGit: true,
+        changes: [
+          { path: "a.txt", kind: "created" },
+          { path: "parallel.txt", kind: "created" },
+        ],
+      },
+      { writtenFiles: ["/repo/a.txt"], bashCommands: [] },
+      cwd,
+    );
+
+    assert.match(summary, /\[zcode\] изменено этим запуском:/);
+    assert.match(summary, /a\.txt \(создан\)/);
+    assert.match(summary, /\[zcode\] изменено в репозитории за время хода, но не этим запуском:/);
+    assert.match(summary, /parallel\.txt \(создан\)/);
+    // The journal file must NOT appear in part 2.
+    const part2 = summary.split("не этим запуском:")[1] ?? "";
+    assert.doesNotMatch(part2, /a\.txt/);
+  });
+
+  test("renderJournaledChangesSummary: parallel edit (not in journal) lands only in part 2", () => {
+    const cwd = "/repo";
+    const summary = renderJournaledChangesSummary(
+      { isGit: true, changes: [{ path: "parallel-only.txt", kind: "created" }] },
+      { writtenFiles: [], bashCommands: [] },
+      cwd,
+    );
+
+    assert.doesNotMatch(summary, /\[zcode\] изменено этим запуском:/);
+    assert.match(summary, /\[zcode\] изменено в репозитории за время хода, но не этим запуском:/);
+    assert.match(summary, /parallel-only\.txt/);
+  });
+
+  test("renderJournaledChangesSummary: file written without content change is 'записан, без изменений'", () => {
+    const cwd = "/repo";
+    const summary = renderJournaledChangesSummary(
+      { isGit: true, changes: [{ path: "other.txt", kind: "created" }] },
+      { writtenFiles: ["/repo/touched-but-same.txt"], bashCommands: [] },
+      cwd,
+    );
+
+    assert.match(summary, /touched-but-same\.txt \(записан, без изменений\)/);
+  });
+
+  test("renderJournaledChangesSummary: Bash count reflected in part 2 header", () => {
+    const cwd = "/repo";
+    const summary = renderJournaledChangesSummary(
+      { isGit: true, changes: [{ path: "bash-outcome.txt", kind: "created" }] },
+      { writtenFiles: [], bashCommands: ["npm run build", "git add -A"] },
+      cwd,
+    );
+
+    // Bash calls were declared this turn, so the source can't be pinned to
+    // "not this run": the header must switch to "источник не установлен" and
+    // show the count with a properly declined word ("2 команды"), and must NOT
+    // assert inclusion ("включая") or blame on "not this run".
+    assert.match(summary, /источник не установлен/);
+    assert.match(summary, /2 команды Bash/);
+    assert.doesNotMatch(summary, /включая/);
+    assert.doesNotMatch(summary, /не этим запуском/);
+    assert.match(summary, /bash-outcome\.txt \(создан\)/);
+  });
+
+  test("renderJournaledChangesSummary: empty parts are not printed", () => {
+    const cwd = "/repo";
+    const noChanges = renderJournaledChangesSummary({ isGit: true, changes: [] }, null, cwd);
+    assert.equal(noChanges, "");
+  });
+
+  test("renderJournaledChangesSummary: .mimosa excluded from both parts", () => {
+    const cwd = "/repo";
+    const summary = renderJournaledChangesSummary(
+      {
+        isGit: true,
+        changes: [
+          { path: ".mimosa/hook.json", kind: "created" },
+          { path: "real.txt", kind: "created" },
+        ],
+      },
+      { writtenFiles: ["/repo/.mimosa/state.json"], bashCommands: [] },
+      cwd,
+    );
+
+    assert.doesNotMatch(summary, /mimosa/);
+    assert.match(summary, /real\.txt/);
+  });
+
+  test("renderJournaledChangesSummary: outside git, part 1 still prints, part 2 noted unavailable", () => {
+    const cwd = "/nowhere";
+    const summary = renderJournaledChangesSummary(
+      { isGit: false, changes: [] },
+      { writtenFiles: ["/nowhere/out.txt"], bashCommands: [] },
+      cwd,
+    );
+
+    assert.match(summary, /\[zcode\] изменено этим запуском:/);
+    assert.match(summary, /out\.txt \(записан, без изменений\)/);
+    assert.match(summary, /сводка по репозиторию недоступна вне git-репозитория/);
+  });
+
+  test("renderJournaledChangesSummary: outside git with empty journal prints nothing", () => {
+    const summary = renderJournaledChangesSummary({ isGit: false, changes: [] }, null, "/nowhere");
+    assert.equal(summary, "");
+  });
+
+  test("parallel edit by another process during the turn lands in part 2, not part 1", async () => {
+    const repo = makeGitRepo();
+    const sinks = makeSinks();
+    const code = await runCli(["code", "write", "one", "file", "--cwd", repo], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        // This run writes its own file via a Write tool call.
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_call",
+          toolName: "Write",
+          input: { file_path: path.join(repo, "mine.txt"), content: "mine" },
+        });
+        fs.writeFileSync(path.join(repo, "mine.txt"), "mine\n");
+        // Simulate a parallel writer touching a different file mid-turn.
+        fs.writeFileSync(path.join(repo, "theirs.txt"), "theirs\n");
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.equal(code, EXIT_OK);
+    const stderr = sinks.stderr();
+    // Part 1: only this run's file.
+    assert.match(stderr, /\[zcode\] изменено этим запуском:/);
+    assert.match(stderr, /mine\.txt \(создан\)/);
+    // Part 2: the parallel edit.
+    assert.match(stderr, /\[zcode\] изменено в репозитории за время хода, но не этим запуском:/);
+    assert.match(stderr, /theirs\.txt \(создан\)/);
+    // mine.txt must not leak into part 2.
+    const part2 = stderr.split("не этим запуском:")[1] ?? "";
+    assert.doesNotMatch(part2, /mine\.txt/);
+  });
+
+  test("file written via Edit tool call is recorded in the journal", async () => {
+    const repo = makeGitRepo();
+    const sinks = makeSinks();
+    const code = await runCli(["code", "edit", "a", "file", "--cwd", repo], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_call",
+          toolName: "Edit",
+          input: { file_path: path.join(repo, "tracked.txt"), old_string: "original", new_string: "edited" },
+        });
+        fs.writeFileSync(path.join(repo, "tracked.txt"), "edited\n");
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.equal(code, EXIT_OK);
+    assert.match(sinks.stderr(), /\[zcode\] изменено этим запуском:/);
+    assert.match(sinks.stderr(), /tracked\.txt \(изменён\)/);
+  });
+
+  test("Bash-only turn reflects command count in part 2 header", async () => {
+    const repo = makeGitRepo();
+    const sinks = makeSinks();
+    const code = await runCli(["code", "run", "a", "command", "--cwd", repo], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_call",
+          toolName: "Bash",
+          input: { command: "echo generated > bash.txt" },
+        });
+        fs.writeFileSync(path.join(repo, "bash.txt"), "generated\n");
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.equal(code, EXIT_OK);
+    const stderr = sinks.stderr();
+    // Bash side effect is NOT in the journal → part 2, with Bash count.
+    // Source is not established (a Bash call ran this turn), so the header
+    // uses "источник не установлен" + a declined count ("1 команда Bash"),
+    // and must not fall back to "включая … команд" or "… не этим запуском".
+    assert.match(stderr, /источник не установлен/);
+    assert.match(stderr, /1 команда Bash/);
+    assert.doesNotMatch(stderr, /включая/);
+    assert.doesNotMatch(stderr, /не этим запуском/);
+    assert.match(stderr, /bash\.txt \(создан\)/);
+  });
+
+  test("summary still prints on turn failure (best-effort, unchanged exit code)", async () => {
+    const repo = makeGitRepo();
+    const sinks = makeSinks();
+    const code = await runCli(["code", "do", "something", "--cwd", repo], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_call",
+          toolName: "Write",
+          input: { file_path: path.join(repo, "partial.txt"), content: "x" },
+        });
+        fs.writeFileSync(path.join(repo, "partial.txt"), "x\n");
+        const err = new Error("Model provider rejected the request.");
+        err.code = "provider_error";
+        err.retryable = true;
+        err.zcodeTurnError = { code: "provider_error", message: err.message };
+        throw err;
+      },
+    });
+
+    assert.equal(code, EXIT_TURN_FAILED);
+    assert.match(sinks.stderr(), /\[zcode\] изменено этим запуском:/);
+    assert.match(sinks.stderr(), /partial\.txt \(создан\)/);
+  });
+
+  test("error while building the summary does not change exit code", async () => {
+    const repo = makeGitRepo();
+    const sinks = makeSinks();
+    const code = await runCli(["code", "do", "something", "--cwd", repo], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      // diffGitSnapshots throws → summary degrades to one "недоступна" line.
+      diffGitSnapshots: () => {
+        throw new Error("git boom");
+      },
+      runTurn: async () => {
+        fs.writeFileSync(path.join(repo, "ok.txt"), "ok\n");
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.equal(code, EXIT_OK);
+    assert.match(sinks.stderr(), /\[zcode\] сводка недоступна: git boom/);
+  });
+
+  test("`code --quiet` suppresses the two-part summary entirely", async () => {
+    const repo = makeGitRepo();
+    const sinks = makeSinks();
+    const code = await runCli(["code", "do", "something", "--cwd", repo, "--quiet"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_call",
+          toolName: "Write",
+          input: { file_path: path.join(repo, "quiet.txt"), content: "x" },
+        });
+        fs.writeFileSync(path.join(repo, "quiet.txt"), "x\n");
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.equal(code, EXIT_OK);
+    assert.doesNotMatch(sinks.stderr(), /изменено этим запуском/);
+    assert.doesNotMatch(sinks.stderr(), /quiet\.txt/);
+    assert.match(sinks.stderr(), /turn usage:/);
+  });
+
+  test("relative file_path in a Write event resolves against --cwd, not process.cwd()", async () => {
+    // makeGitRepo() lands the repo under os.tmpdir(), which is guaranteed to
+    // differ from the test process's own cwd — so a relative path resolved
+    // against process.cwd() would miss the repo entirely and never match git.
+    const repo = makeGitRepo();
+    assert.notEqual(path.resolve(repo), path.resolve(process.cwd()));
+
+    const sinks = makeSinks();
+    const code = await runCli(["code", "create", "a", "file", "--cwd", repo], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        // Relative path — MUST be resolved against the run's --cwd (the repo),
+        // not the test process's cwd.
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_call",
+          toolName: "Write",
+          input: { file_path: "mine.txt", content: "mine" },
+        });
+        // The file really lands in the temp repo so git sees it.
+        fs.writeFileSync(path.join(repo, "mine.txt"), "mine\n");
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.equal(code, EXIT_OK);
+    const stderr = sinks.stderr();
+    // Part 1: this run's write, owned by the journal.
+    assert.match(stderr, /\[zcode\] изменено этим запуском:/);
+    assert.match(stderr, /mine\.txt \(создан\)/);
+    // Part 2: there must be NO "changed in the repo but not by this run"
+    // section — the journal already accounts for mine.txt, so git's change
+    // is attributed to this run rather than appearing as a parallel edit.
+    assert.equal(stderr.split("изменено в репозитории за время хода")[1], undefined);
+  });
+
+  test("symlinked working dir + Write-then-delete lands the file in only one part", async () => {
+    const repoReal = makeGitRepo();
+    // Commit a tracked file the turn will overwrite-then-delete, so git sees a
+    // real deletion once the turn ends (an untracked file created+deleted would
+    // leave no trace in git status).
+    fs.writeFileSync(path.join(repoReal, "deep.txt"), "original\n");
+    git(repoReal, ["add", "deep.txt"]);
+    git(repoReal, ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "add deep", "--quiet"]);
+
+    // Run THROUGH a symlink: the journal records .../repo-link/deep.txt while
+    // git's rev-parse resolves it to .../repo-real/deep.txt. A deleted file
+    // only canonicalizes to the same form as git if canonicalizePath walks up
+    // to the nearest existing (real) parent.
+    const repoLink = path.join(tmpDir, `repo-link-${repoCounter}`);
+    fs.symlinkSync(repoReal, repoLink);
+
+    const sinks = makeSinks();
+    const code = await runCli(["code", "edit", "a", "file", "--cwd", repoLink], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_call",
+          toolName: "Write",
+          // Absolute path through the symlink: isolates this test from the
+          // relative-path resolution fix (that one belongs to test 1).
+          input: { file_path: path.join(repoLink, "deep.txt"), content: "deep" },
+        });
+        fs.writeFileSync(path.join(repoLink, "deep.txt"), "deep\n");
+        // ...then delete it in the same turn: on disk it is gone by the end.
+        fs.rmSync(path.join(repoLink, "deep.txt"));
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.equal(code, EXIT_OK);
+    const stderr = sinks.stderr();
+    // The journal owns this file → part 1, with git's "deleted" kind.
+    assert.match(stderr, /\[zcode\] изменено этим запуском:/);
+    assert.match(stderr, /deep\.txt \(удалён\)/);
+    // ...and it must NOT also appear in part 2 (the "not by this run" section):
+    // the same file must not land in both parts.
+    assert.equal(stderr.split("изменено в репозитории за время хода")[1], undefined);
+  });
+
+  test("write-then-delete outside --cwd lands in only one part (no /var vs /private/var split)", async () => {
+    const repoReal = makeGitRepo();
+    // `sub` is a real subdirectory the turn's --cwd will point at through a
+    // symlink, so paths written "up and out" of it (../outside.txt) land at the
+    // repo ROOT — inside git but OUTSIDE the run's cwd.
+    fs.mkdirSync(path.join(repoReal, "sub"), { recursive: true });
+    // A tracked file at the repo root; overwriting then deleting it during the
+    // turn makes git later report a deletion while the journal owns the write.
+    fs.writeFileSync(path.join(repoReal, "outside.txt"), "original\n");
+    git(repoReal, ["add", "outside.txt"]);
+    git(repoReal, ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-m", "add outside", "--quiet"]);
+
+    // Reach the repo THROUGH a symlink: the journal records the symlink form
+    // (`/var/...`/`/tmp/...`) while git resolves to `/private/...`. Before the
+    // fix, resolveDisplayPath's outside-cwd branch passed those raw values to
+    // formatDisplayPath, whose final `return raw` then returned the non-canonical
+    // form — so the same file appeared in BOTH parts of the summary.
+    const repoLink = path.join(tmpDir, `repo-link-outside-${repoCounter}`);
+    fs.symlinkSync(repoReal, repoLink);
+    const cwd = path.join(repoLink, "sub");
+
+    const sinks = makeSinks();
+    const code = await runCli(["code", "write", "../outside.txt", "--cwd", cwd], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_call",
+          toolName: "Write",
+          input: { file_path: "../outside.txt", content: "deep" },
+        });
+        fs.writeFileSync(path.join(cwd, "../outside.txt"), "deep\n");
+        fs.rmSync(path.join(cwd, "../outside.txt"));
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.equal(code, EXIT_OK);
+    const stderr = sinks.stderr();
+    // Part 1: the journal owns this file → deleted.
+    assert.match(stderr, /\[zcode\] изменено этим запуском:/);
+    assert.match(stderr, /outside\.txt \(удалён\)/);
+    // Part 2: must NOT also list it — the file must not land in both parts.
+    assert.equal(stderr.split("изменено в репозитории за время хода")[1], undefined);
+  });
+});
+
+// -------------------------------------------------------------- state values
+//
+// `state.updated` progress lines should show concrete model=/mode= values from
+// the patch when present, instead of bare reason strings like "model_changed".
+
+describe("state.updated shows model=/mode= values", () => {
+  test("prints model= and mode= when patch carries them", async () => {
+    const sinks = makeSinks();
+    await runCli(["code", "do", "something"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({
+          type: "state.updated",
+          reason: "model_changed",
+          patch: { model: { current: { modelId: "glm-5.3-flash" } }, mode: { current: "build" } },
+        });
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.match(sinks.stderr(), /\[zcode\] model=glm-5\.3-flash mode=build/);
+    assert.doesNotMatch(sinks.stderr(), /model_changed/);
+  });
+
+  test("prints only model= when mode is absent", async () => {
+    const sinks = makeSinks();
+    await runCli(["code", "do", "something"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({
+          type: "state.updated",
+          reason: "model_changed",
+          patch: { model: { current: { modelId: "glm-5.3" } } },
+        });
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.match(sinks.stderr(), /\[zcode\] model=glm-5\.3\b/);
+    assert.doesNotMatch(sinks.stderr(), /mode=/);
+  });
+
+  test("falls back to reason string when patch has no model/mode", async () => {
+    const sinks = makeSinks();
+    await runCli(["code", "do", "something"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({ type: "state.updated", reason: "prompt_started", patch: { status: "running" } });
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.match(sinks.stderr(), /\[zcode\] prompt_started/);
+  });
+
+  test("state.updated with no model/mode and no reason prints nothing", async () => {
+    const sinks = makeSinks();
+    await runCli(["code", "do", "something"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({ type: "state.updated", patch: { status: "idle" } });
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    // No bare reason line, no model=/mode= line.
+    assert.doesNotMatch(sinks.stderr(), /\[zcode\] idle/);
+  });
+
+  test("state.updated with a model/mode value that is an object never prints [object Object]", async () => {
+    const sinks = makeSinks();
+    await runCli(["code", "do", "something"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        // A malformed/edge patch where the model value is an object rather than
+        // a string: the type guard must drop it instead of stringifying it to
+        // "[object Object]" on stderr. mode is a valid string and must still show.
+        args.onProgress({
+          type: "state.updated",
+          reason: "model_changed",
+          patch: { model: { current: { modelId: { nested: "object" } } }, mode: { current: "build" } },
+        });
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.doesNotMatch(sinks.stderr(), /\[object Object\]/);
+    assert.match(sinks.stderr(), /mode=build/);
+  });
+
+  test("state.updated redacts a secret-shaped string value via redactSecrets", async () => {
+    const sinks = makeSinks();
+    await runCli(["code", "do", "something"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        // A model/mode value whose string content carries a JSON "apiKey"
+        // field — exactly the shape API_KEY_PATTERN targets — must not reach
+        // stderr verbatim.
+        args.onProgress({
+          type: "state.updated",
+          reason: "model_changed",
+          patch: { model: { current: { modelId: '{"apiKey":"sk-test-secret"}' } }, mode: { current: "build" } },
+        });
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    assert.doesNotMatch(sinks.stderr(), /sk-test-secret/);
+  });
+
+  test("duplicate startup state.updated lines collapse: two identical -> one; a changed value -> a second", async () => {
+    const sinks = makeSinks();
+    await runCli(["code", "do", "something"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        const state = (mode) => ({
+          type: "state.updated",
+          patch: { model: { current: { modelId: "glm-5.3" } }, mode: { current: mode } },
+        });
+        args.onProgress(state("build")); // emitted
+        args.onProgress(state("build")); // identical duplicate -> suppressed
+        args.onProgress(state("yolo")); // value changed -> emitted again
+        return {
+          sessionId: "s1",
+          response: "done",
+          usage: { totalTokens: 10 },
+          sessionUsage: { totalTokens: 10 },
+          events: [],
+          resultType: "completed",
+        };
+      },
+    });
+
+    const matches = sinks.stderr().match(/\[zcode\] model=glm-5\.3 mode=\w+/g) || [];
+    assert.equal(matches.length, 2);
+    assert.equal(matches[0], "[zcode] model=glm-5.3 mode=build");
+    assert.equal(matches[1], "[zcode] model=glm-5.3 mode=yolo");
+  });
+});
+
+// ------------------------------------------------ A: честный заголовок второй части
+
+describe("А: честный заголовок второй части (declineCommands + header)", () => {
+  test("declineCommands declines 'команда' by last digit (incl. 11/111)", () => {
+    assert.equal(declineCommands(1), "команда");
+    assert.equal(declineCommands(2), "команды");
+    assert.equal(declineCommands(3), "команды");
+    assert.equal(declineCommands(4), "команды");
+    assert.equal(declineCommands(5), "команд");
+    assert.equal(declineCommands(0), "команд");
+    assert.equal(declineCommands(9), "команд");
+    assert.equal(declineCommands(10), "команд");
+    assert.equal(declineCommands(11), "команд");
+    assert.equal(declineCommands(12), "команд");
+    assert.equal(declineCommands(13), "команд");
+    assert.equal(declineCommands(14), "команд");
+    assert.equal(declineCommands(21), "команда");
+    assert.equal(declineCommands(22), "команды");
+    assert.equal(declineCommands(25), "команд");
+    assert.equal(declineCommands(111), "команд");
+  });
+
+  test("part 2 header with Bash calls says source is not established (2 commands)", () => {
+    const summary = renderJournaledChangesSummary(
+      { isGit: true, changes: [{ path: "bash-outcome.txt", kind: "created" }] },
+      { writtenFiles: [], bashCommands: ["npm run build", "git add -A"] },
+      "/repo",
+    );
+    assert.match(summary, /источник не установлен/);
+    assert.match(summary, /2 команды Bash/);
+    // Must not claim inclusion ("включая") or blame on "not this run".
+    assert.doesNotMatch(summary, /включая/);
+    assert.doesNotMatch(summary, /не этим запуском/);
+    assert.match(summary, /bash-outcome\.txt \(создан\)/);
+  });
+
+  test("part 2 header declines the count for 1 и 5 и 11 Bash calls", () => {
+    const one = renderJournaledChangesSummary(
+      { isGit: true, changes: [{ path: "b.txt", kind: "created" }] },
+      { writtenFiles: [], bashCommands: ["ls -la"] },
+      "/repo",
+    );
+    assert.match(one, /1 команда Bash/);
+
+    const five = renderJournaledChangesSummary(
+      { isGit: true, changes: [{ path: "b.txt", kind: "created" }] },
+      { writtenFiles: [], bashCommands: Array(5).fill("x") },
+      "/repo",
+    );
+    assert.match(five, /5 команд Bash/);
+
+    const eleven = renderJournaledChangesSummary(
+      { isGit: true, changes: [{ path: "b.txt", kind: "created" }] },
+      { writtenFiles: [], bashCommands: Array(11).fill("x") },
+      "/repo",
+    );
+    assert.match(eleven, /11 команд Bash/);
+  });
+
+  test("part 2 header with NO Bash calls falls back to 'не этим запуском'", () => {
+    const summary = renderJournaledChangesSummary(
+      { isGit: true, changes: [{ path: "parallel.txt", kind: "created" }] },
+      { writtenFiles: [], bashCommands: [] },
+      "/repo",
+    );
+    assert.match(summary, /\[zcode\] изменено в репозитории за время хода, но не этим запуском:/);
+    assert.doesNotMatch(summary, /источник не установлен/);
+    assert.doesNotMatch(summary, /Bash/);
   });
 });
