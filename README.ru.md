@@ -7,9 +7,9 @@
 ![node](https://img.shields.io/badge/node-%3E%3D18.18-brightgreen)
 ![dependencies](https://img.shields.io/badge/dependencies-0-lightgrey)
 
-Передаёт написание и ревью кода из Claude Code в **ZCode** — агентную среду
-для программирования от [Z.ai](https://z.ai) на моделях GLM (GLM-5.3,
-GLM-5.3-Flash, GLM-5-Turbo).
+Передаёт написание и ревью кода из Claude Code в
+**[ZCode](https://zcode.z.ai/en)** — агентную среду для программирования от
+[Z.ai](https://z.ai) на моделях GLM (GLM-5.3, GLM-5.3-Flash, GLM-5-Turbo).
 
 Claude остаётся оркестратором: планирует, делегирует и проверяет результат.
 ZCode пишет код или даёт второе мнение по диффу. Идея та же, что у
@@ -42,8 +42,9 @@ ZCode пишет код или даёт второе мнение по дифф�
 ## Требования
 
 - **[Claude Code](https://claude.com/claude-code)** с поддержкой плагинов.
-- **ZCode.app**. CLI `zcode` идёт внутри приложения, отдельно ставить ничего не
-  нужно. Отдельно установленный `zcode` на `PATH` тоже подойдёт.
+- **ZCode.app**, скачать можно на [zcode.z.ai](https://zcode.z.ai/en). CLI
+  `zcode` идёт внутри приложения, отдельно ставить ничего не нужно. Отдельно
+  установленный `zcode` на `PATH` тоже подойдёт.
 - **Node.js 18.18+**.
 - **Ключ Z.ai API** в переменной окружения `ZAI_API_KEY`.
 

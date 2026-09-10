@@ -7,8 +7,9 @@
 ![node](https://img.shields.io/badge/node-%3E%3D18.18-brightgreen)
 ![dependencies](https://img.shields.io/badge/dependencies-0-lightgrey)
 
-在 Claude Code 中把编码和代码审查交给 **ZCode**——由 [Z.ai](https://z.ai)
-推出、基于 GLM 模型（GLM-5.3、GLM-5.3-Flash、GLM-5-Turbo）的智能编程环境。
+在 Claude Code 中把编码和代码审查交给 **[ZCode](https://zcode.z.ai/cn)**——
+由 [Z.ai](https://z.ai) 推出、基于 GLM 模型（GLM-5.3、GLM-5.3-Flash、
+GLM-5-Turbo）的智能编程环境。
 
 Claude 仍是编排者：负责规划、分派任务并检查结果。ZCode 负责写代码，或对
 diff 给出第二意见。思路与
@@ -37,8 +38,8 @@ diff 给出第二意见。思路与
 ## 环境要求
 
 - 支持插件的 **[Claude Code](https://claude.com/claude-code)**。
-- **ZCode.app**。`zcode` CLI 随应用一起提供，无需另行安装。也可以使用 `PATH`
-  上单独安装的 `zcode`。
+- **ZCode.app**，可从 [zcode.z.ai](https://zcode.z.ai/cn) 下载。`zcode` CLI
+  随应用一起提供，无需另行安装。也可以使用 `PATH` 上单独安装的 `zcode`。
 - **Node.js 18.18+**。
 - **Z.ai API 密钥**，通过环境变量 `ZAI_API_KEY` 提供。
 

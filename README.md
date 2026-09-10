@@ -7,9 +7,10 @@
 ![node](https://img.shields.io/badge/node-%3E%3D18.18-brightgreen)
 ![dependencies](https://img.shields.io/badge/dependencies-0-lightgrey)
 
-Hand coding and code review off from Claude Code to **ZCode**, the agentic
-coding environment from [Z.ai](https://z.ai) that runs on GLM models (GLM-5.3,
-GLM-5.3-Flash, GLM-5-Turbo).
+Hand coding and code review off from Claude Code to
+**[ZCode](https://zcode.z.ai/en)**, the agentic coding environment from
+[Z.ai](https://z.ai) that runs on GLM models (GLM-5.3, GLM-5.3-Flash,
+GLM-5-Turbo).
 
 Claude stays the orchestrator: it plans, delegates, and checks the result. ZCode
 does the typing or gives a second opinion on a diff. Same idea as
@@ -43,8 +44,9 @@ ZCode/GLM in place of Codex/GPT.
 ## Requirements
 
 - **[Claude Code](https://claude.com/claude-code)** with plugin support.
-- **ZCode.app**. The `zcode` CLI ships inside the app, so there is nothing else
-  to install. A standalone `zcode` on `PATH` works too.
+- **ZCode.app**, available from [zcode.z.ai](https://zcode.z.ai/en). The `zcode`
+  CLI ships inside the app, so there is nothing else to install. A standalone
+  `zcode` on `PATH` works too.
 - **Node.js 18.18+**.
 - A **Z.ai API key**, exported as `ZAI_API_KEY`.
 
