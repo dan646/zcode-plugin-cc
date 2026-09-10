@@ -65,7 +65,7 @@ let nextServerRequestId = 1;
 // from this extension.
 //
 // Recognized scenarios: success, failure, no-providers, timeout, stop,
-// usage-fail, permission, user-input (see scheduleTurnEvents, the
+// usage-fail, permission, permission-write, permission-edit, user-input (see scheduleTurnEvents, the
 // `session/send` case's own `interaction/*` branches, and the session/usage
 // case below), plus four heartbeat-specific scenarios (see both places
 // below): heartbeat-growth, heartbeat-flaky, heartbeat-dead. Like "timeout",
@@ -712,10 +712,16 @@ rl.on("line", (line) => {
         // on exactly what `session.mjs`'s handler answered, the same way
         // `debugScopesSeen` lets other scenarios assert on the
         // requestRuntimePreferences round trips.
-        if (scenario === "permission") {
+        if (scenario === "permission" || scenario === "permission-write" || scenario === "permission-edit") {
+          const permissionParams =
+            scenario === "permission-write"
+              ? { toolName: "Write", toolCallId: "write-1", input: { file_path: "src/inside.txt", content: "x" } }
+              : scenario === "permission-edit"
+                ? { toolName: "Edit", toolCallId: "edit-1", input: { file_path: "docs/outside.txt", old_string: "a", new_string: "b" } }
+                : { toolName: "write_file", reason: "test scenario: write a file", riskLevel: "medium" };
           sendServerRequest(
             "interaction/requestPermission",
-            { toolName: "write_file", reason: "test scenario: write a file", riskLevel: "medium" },
+            permissionParams,
             (reply) => {
               emitEvent(sessionId, "turn.completed", {
                 response: reply.result?.decision === "allow" ? "wrote the file" : "could not write the file",

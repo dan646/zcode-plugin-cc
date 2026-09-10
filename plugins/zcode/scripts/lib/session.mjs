@@ -510,6 +510,9 @@ async function fetchSessionUsage(client, sessionId) {
  * @returns {(params: any, message: any) => { decision: "allow" | "deny", reason: string }}
  */
 function makeRequestPermissionHandler(policy) {
+  if (typeof policy === "object" && policy?.type === "write-scope" && typeof policy.decide === "function") {
+    return (params) => policy.decide(params);
+  }
   if (policy === "allow") {
     return () => ({
       decision: "allow",
@@ -581,7 +584,7 @@ function requestUserInputHandler() {
  *   onProgress?: (event: any) => void,
  *   timeoutMs?: number,
  *   cancelGraceMs?: number,
- *   permissionPolicy?: "allow" | "deny",
+ *   permissionPolicy?: "allow" | "deny" | { type: "write-scope", decide(params: any): { decision: "allow" | "deny", reason: string } },
  *   heartbeatIntervalMs?: number,
  *   heartbeatProbeTimeoutMs?: number,
  *   deadProbeThreshold?: number,
@@ -630,7 +633,9 @@ export async function runTurn({
   stallWarnMs = DEFAULT_STALL_WARN_MS,
   clientOptions = {},
 }) {
-  if (!PERMISSION_POLICIES.includes(permissionPolicy)) {
+  const isWriteScopePolicy =
+    typeof permissionPolicy === "object" && permissionPolicy?.type === "write-scope" && typeof permissionPolicy.decide === "function";
+  if (!PERMISSION_POLICIES.includes(permissionPolicy) && !isWriteScopePolicy) {
     throw new Error(
       `runTurn: invalid permissionPolicy ${JSON.stringify(permissionPolicy)} — ` +
         `must be one of ${JSON.stringify(PERMISSION_POLICIES)}.`,

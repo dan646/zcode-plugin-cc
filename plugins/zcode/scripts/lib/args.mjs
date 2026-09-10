@@ -10,10 +10,11 @@
 /**
  * @typedef {{
  *   valueOptions?: string[],
+ *   repeatableValueOptions?: string[],
  *   booleanOptions?: string[],
  *   aliasMap?: Record<string, string>,
  * }} ParseArgsConfig
- * @typedef {{ options: Record<string, string | boolean>, positionals: string[] }} ParsedArgs
+ * @typedef {{ options: Record<string, string | string[] | boolean>, positionals: string[] }} ParsedArgs
  */
 
 /**
@@ -30,6 +31,7 @@
  */
 export function parseArgs(argv, config = {}) {
   const valueOptions = new Set(config.valueOptions ?? []);
+  const repeatableValueOptions = new Set(config.repeatableValueOptions ?? []);
   const booleanOptions = new Set(config.booleanOptions ?? []);
   const aliasMap = config.aliasMap ?? {};
   const options = {};
@@ -71,12 +73,17 @@ export function parseArgs(argv, config = {}) {
         continue;
       }
 
-      if (valueOptions.has(key)) {
+      if (valueOptions.has(key) || repeatableValueOptions.has(key)) {
         const nextValue = inlineValue ?? argv[index + 1];
         if (nextValue === undefined) {
           throw new Error(`Missing value for --${rawKey}`);
         }
-        options[key] = nextValue;
+        if (repeatableValueOptions.has(key)) {
+          const previous = options[key];
+          options[key] = [...(Array.isArray(previous) ? previous : []), nextValue];
+        } else {
+          options[key] = nextValue;
+        }
         if (inlineValue === undefined) {
           index += 1;
         }
@@ -98,12 +105,17 @@ export function parseArgs(argv, config = {}) {
       continue;
     }
 
-    if (valueOptions.has(key)) {
+    if (valueOptions.has(key) || repeatableValueOptions.has(key)) {
       const nextValue = argv[index + 1];
       if (nextValue === undefined) {
         throw new Error(`Missing value for -${shortKey}`);
       }
-      options[key] = nextValue;
+      if (repeatableValueOptions.has(key)) {
+        const previous = options[key];
+        options[key] = [...(Array.isArray(previous) ? previous : []), nextValue];
+      } else {
+        options[key] = nextValue;
+      }
       index += 1;
       continue;
     }

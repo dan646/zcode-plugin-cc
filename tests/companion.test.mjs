@@ -54,6 +54,105 @@ after(() => {
   fs.rmSync(tmpDir, { recursive: true, force: true });
 });
 
+describe("code write scope", () => {
+  test("forces build mode for a scope when --mode is omitted", async () => {
+    const sinks = makeSinks();
+    let capturedCall = null;
+    const code = await runCli(["code", "write", "--allow", "src/**"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        capturedCall = args;
+        return { sessionId: "s1", response: "done", usage: {}, sessionUsage: {}, events: [], resultType: "completed" };
+      },
+    });
+    assert.equal(code, EXIT_OK);
+    assert.equal(capturedCall.mode, "build");
+  });
+
+  for (const mode of ["edit", "yolo"]) {
+    test(`rejects --mode ${mode} with a scope before starting a turn`, async () => {
+      const sinks = makeSinks();
+      let called = false;
+      const code = await runCli(["code", "write", "--allow", "src/**", "--mode", mode], {
+        ...sinks,
+        resolveZcodeCli: fakeResolveZcodeCli,
+        runTurn: async () => {
+          called = true;
+        },
+      });
+      assert.equal(code, EXIT_ERROR);
+      assert.equal(called, false);
+      assert.match(sinks.stderr(), /approves writes itself/);
+    });
+  }
+
+  test("passes a scoped policy to code, logs it, and retains Bash permission", async () => {
+    const sinks = makeSinks();
+    let policy;
+    const code = await runCli(["code", "write", "--allow", "src/**", "--deny", "src/private/**", "--quiet=false"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        policy = args.permissionPolicy;
+        return { sessionId: "s1", response: "done", usage: {}, sessionUsage: {}, events: [], resultType: "completed" };
+      },
+    });
+    assert.equal(code, EXIT_OK);
+    assert.equal(policy.decide({ toolName: "Write", input: { file_path: "src/ok.mjs" } }).decision, "allow");
+    assert.equal(policy.decide({ toolName: "Edit", input: { file_path: "src/private/no.mjs" } }).decision, "deny");
+    assert.equal(policy.decide({ toolName: "Bash", input: { command: "touch docs/outside.txt" } }).decision, "allow");
+    assert.match(sinks.stderr(), /write scope enabled: allow=src\/\*\*/);
+    assert.match(sinks.stderr(), /Bash is not restricted/);
+  });
+
+  test("canonicalizes a symlink before checking the write scope", async () => {
+    const repo = makeGitRepo();
+    const outside = path.join(tmpDir, "scope-outside");
+    fs.mkdirSync(outside);
+    fs.symlinkSync(outside, path.join(repo, "src"));
+    const sinks = makeSinks();
+    let policy;
+    await runCli(["code", "write", "--cwd", repo, "--allow", "src/**", "--quiet=false"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        policy = args.permissionPolicy;
+        return { sessionId: "s1", response: "done", usage: {}, sessionUsage: {}, events: [], resultType: "completed" };
+      },
+    });
+    assert.equal(policy.decide({ toolName: "Write", input: { file_path: "src/escaped.txt" } }).decision, "deny");
+  });
+
+  test("excluded tool call is omitted from part one and appears as denied", () => {
+    const journal = createFileJournal("/repo");
+    journal.recordToolCall("Write", { file_path: "docs/outside.txt" }, "tool-1");
+    journal.recordDeniedToolCall("tool-1", "/repo/docs/outside.txt");
+    const summary = renderJournaledChangesSummary(
+      { isGit: true, changes: [] },
+      journal,
+      "/repo",
+    );
+    assert.match(summary, /отклонено: вне области/);
+    assert.match(summary, /docs\/outside\.txt/);
+    assert.doesNotMatch(summary, /изменено этим запуском/);
+  });
+
+  test("code without a scope keeps the legacy allow policy", async () => {
+    const sinks = makeSinks();
+    let policy;
+    await runCli(["code", "write", "--quiet"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        policy = args.permissionPolicy;
+        return { sessionId: "s1", response: "done", usage: {}, sessionUsage: {}, events: [], resultType: "completed" };
+      },
+    });
+    assert.equal(policy, "allow");
+  });
+});
+
 let repoCounter = 0;
 function git(cwd, args) {
   return execFileSync("git", args, { cwd, encoding: "utf8" });
@@ -104,6 +203,13 @@ describe("parseArgs", () => {
   test("supports --key=value inline form", () => {
     const { options } = parseArgs(["--model=glm-5.3-flash"], { valueOptions: ["model"] });
     assert.equal(options.model, "glm-5.3-flash");
+  });
+
+  test("collects repeatable value options in argv order", () => {
+    const { options } = parseArgs(["--allow", "app/**", "--allow=tests/**", "--deny", "app/private/**"], {
+      repeatableValueOptions: ["allow", "deny"],
+    });
+    assert.deepEqual(options, { allow: ["app/**", "tests/**"], deny: ["app/private/**"] });
   });
 
   test("--key=value only splits on the first '=' — the rest stays in the value", () => {
@@ -2141,6 +2247,21 @@ describe("state.updated shows model=/mode= values", () => {
     assert.equal(matches.length, 2);
     assert.equal(matches[0], "[zcode] model=glm-5.3 mode=build");
     assert.equal(matches[1], "[zcode] model=glm-5.3 mode=yolo");
+  });
+
+  test("dedupe key distinguishes model/mode values containing the old separator", async () => {
+    const sinks = makeSinks();
+    await runCli(["code", "do", "something", "--quiet=false"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({ type: "state.updated", patch: { model: { current: { modelId: "a::b" } }, mode: { current: "c" } } });
+        args.onProgress({ type: "state.updated", patch: { model: { current: { modelId: "a" } }, mode: { current: "b::c" } } });
+        return { sessionId: "s1", response: "done", usage: {}, sessionUsage: {}, events: [], resultType: "completed" };
+      },
+    });
+    assert.match(sinks.stderr(), /model=a::b mode=c/);
+    assert.match(sinks.stderr(), /model=a mode=b::c/);
   });
 });
 

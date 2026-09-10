@@ -54,26 +54,48 @@ export const FILE_WRITING_TOOLS = Object.freeze(["Write", "Edit"]);
  * @param {string} cwd absolute working directory of the run
  * @returns {{
  *   writtenFiles: Set<string>,
+ *   deniedFiles: Set<string>,
  *   bashCommands: string[],
- *   recordToolCall(toolName: string, input: any): void,
+ *   recordToolCall(toolName: string, input: any, toolCallId?: unknown): void,
+ *   recordDeniedToolCall(toolCallId: unknown, absPath: string): void,
  * }}
  */
 export function createFileJournal(cwd = process.cwd()) {
   const writtenFiles = new Set();
+  const deniedFiles = new Set();
   const bashCommands = [];
+  const writeAttempts = new Map();
+  let anonymousWriteId = 0;
+  const refreshWrittenPath = (absPath) => {
+    const hasAllowedAttempt = [...writeAttempts.values()].some((attempt) => attempt.path === absPath && !attempt.denied);
+    if (hasAllowedAttempt) writtenFiles.add(absPath);
+    else writtenFiles.delete(absPath);
+  };
   return {
     writtenFiles,
+    deniedFiles,
     bashCommands,
-    recordToolCall(toolName, input) {
+    recordToolCall(toolName, input, toolCallId) {
       if (FILE_WRITING_TOOLS.includes(toolName)) {
         const fp = input?.file_path ?? input?.filePath;
         if (typeof fp === "string" && fp.trim()) {
-          writtenFiles.add(path.resolve(cwd, fp));
+          const absPath = path.resolve(cwd, fp);
+          const id = toolCallId ?? `anonymous-write-${anonymousWriteId++}`;
+          writeAttempts.set(id, { path: absPath, denied: false });
+          refreshWrittenPath(absPath);
         }
       } else if (toolName === "Bash") {
         const cmd = input?.command;
         if (typeof cmd === "string") bashCommands.push(cmd);
       }
+    },
+    recordDeniedToolCall(toolCallId, absPath) {
+      const attempt = writeAttempts.get(toolCallId);
+      if (attempt) {
+        attempt.denied = true;
+        refreshWrittenPath(attempt.path);
+      }
+      if (typeof absPath === "string" && absPath) deniedFiles.add(absPath);
     },
   };
 }
@@ -583,7 +605,7 @@ export function declineCommands(n) {
  * parts collapse back into the old single undifferentiated list.
  *
  * @param {{ isGit: boolean, changes?: Array<{ path: string, kind: "created" | "modified" | "deleted" }> }} diffResult
- * @param {{ writtenFiles?: Iterable<string>, bashCommands?: string[] } | null} journal
+ * @param {{ writtenFiles?: Iterable<string>, deniedFiles?: Iterable<string>, bashCommands?: string[] } | null} journal
  * @param {string} cwd
  * @returns {string}
  */
@@ -633,6 +655,20 @@ export function renderJournaledChangesSummary(diffResult, journal, cwd) {
     }
   }
 
+  const deniedDisplayPaths = new Set();
+  if (journal) {
+    for (const absPath of journal.deniedFiles ?? []) {
+      const displayPath = resolveDisplayPath(absPath, cwd);
+      if (!isZcodeServicePath(displayPath)) deniedDisplayPaths.add(displayPath);
+    }
+  }
+  if (deniedDisplayPaths.size > 0) {
+    lines.push("[zcode] отклонено: вне области:");
+    for (const displayPath of [...deniedDisplayPaths].sort()) {
+      lines.push(`[zcode]   ${displayPath}`);
+    }
+  }
+
   const bashCount = journal?.bashCommands?.length ?? 0;
   if (part2.length > 0) {
     if (bashCount > 0) {
@@ -669,4 +705,3 @@ export function renderJournaledChangesSummary(diffResult, journal, cwd) {
   if (lines.length === 0) return "";
   return lines.join("\n") + "\n";
 }
-

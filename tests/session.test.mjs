@@ -18,6 +18,7 @@ import {
   isProviderConfigured,
   DEFAULT_PERMISSION_POLICY,
 } from "../plugins/zcode/scripts/lib/session.mjs";
+import { createWriteScopePolicy } from "../plugins/zcode/scripts/lib/write-scope.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const FIXTURE_PATH = path.join(__dirname, "fake-app-server.mjs");
@@ -157,7 +158,7 @@ describe("runTurn — successful path", () => {
     }
   });
 
-  test("calls session/setMode only when a mode is given, and never otherwise", async () => {
+  test("calls session/setMode only when a mode is given, including build", async () => {
     const noModeSpy = spyOnCalls();
     try {
       await runTurn({ cli: FIXTURE_CLI, workspace: scenarioWorkspace("success"), prompt: "hi" });
@@ -180,6 +181,21 @@ describe("runTurn — successful path", () => {
       assert.deepEqual(setModeCall.params, { sessionId: result.sessionId, mode: "plan" });
     } finally {
       withModeSpy.restore();
+    }
+
+    const buildModeSpy = spyOnCalls();
+    try {
+      const result = await runTurn({
+        cli: FIXTURE_CLI,
+        workspace: scenarioWorkspace("success"),
+        prompt: "hi",
+        mode: "build",
+      });
+      const setModeCall = buildModeSpy.calls.find((c) => c.method === "session/setMode");
+      assert.ok(setModeCall, "session/setMode must be called for explicit build mode");
+      assert.deepEqual(setModeCall.params, { sessionId: result.sessionId, mode: "build" });
+    } finally {
+      buildModeSpy.restore();
     }
   });
 
@@ -550,6 +566,24 @@ describe("runTurn — permissionPolicy (interaction/requestPermission)", () => {
 
     const completed = result.events.find((e) => e.type === "turn.completed");
     assert.equal(completed.params.payload.debugInteractionReply.result.decision, "deny");
+  });
+
+  test("a write-scope policy answers Write/ Edit requests through the protocol handler", async () => {
+    const policy = createWriteScopePolicy({ cwd: "/scope", allow: ["src/**"] });
+    const write = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("permission-write"),
+      prompt: "please write a file",
+      permissionPolicy: policy,
+    });
+    const edit = await runTurn({
+      cli: FIXTURE_CLI,
+      workspace: scenarioWorkspace("permission-edit"),
+      prompt: "please edit a file",
+      permissionPolicy: policy,
+    });
+    assert.equal(write.events.find((event) => event.type === "turn.completed").params.payload.debugInteractionReply.result.decision, "allow");
+    assert.equal(edit.events.find((event) => event.type === "turn.completed").params.payload.debugInteractionReply.result.decision, "deny");
   });
 
   test("an invalid permissionPolicy is rejected before any call is made", async () => {

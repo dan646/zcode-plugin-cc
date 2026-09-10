@@ -37,6 +37,7 @@ import {
   renderJournaledChangesSummary,
 } from "./lib/diff.mjs";
 import { formatDisplayPath } from "./lib/paths.mjs";
+import { createWriteScopePolicy } from "./lib/write-scope.mjs";
 import { resolveZcodeCli, workspaceRef } from "./lib/locate.mjs";
 import { runTurn, readWorkspaceState, isProviderConfigured, formatDurationMs } from "./lib/session.mjs";
 import { redactSecrets, capDiagText } from "./lib/protocol.mjs";
@@ -101,9 +102,11 @@ const DEFAULT_REVIEW_TIMEOUT_SECONDS = 1800;
 // surface entirely from the app-server protocol this plugin drives.
 //
 // IMPORTANT — this is ZCode's own agent-behavior mode, NOT this plugin's
-// write permission: `code`/`review` already always pass `permissionPolicy:
-// "allow"` to `runTurn` regardless of `--mode` (see their call sites below),
-// so ZCode is always ALLOWED to write files. `--mode` instead tells ZCode's
+// write permission: `review` and unscoped `code` pass `permissionPolicy:
+// "allow"` to `runTurn` regardless of `--mode`; scoped `code` supplies a
+// path-checking policy. Scoped runs explicitly use build unless the user
+// selects build or plan: edit/yolo auto-approve writes before the policy can
+// answer. `--mode` instead tells ZCode's
 // own agent loop how it should behave with that permission — e.g. "plan"
 // makes it propose a plan without touching any files even though it *could*,
 // "yolo" skips ZCode's own internal confirmations. Conflating the two is
@@ -131,13 +134,19 @@ Common options:
   --timeout <seconds>       Turn timeout in seconds (code/review only; defaults: code=${DEFAULT_CODE_TIMEOUT_SECONDS}, review=${DEFAULT_REVIEW_TIMEOUT_SECONDS})
   --mode <${ZCODE_MODES.join("|")}>
                             ZCode's own operating mode for this turn (code/review only). This is
-                            NOT this plugin's write permission — code/review already always pass
-                            permissionPolicy: "allow" to runTurn, with or without --mode, so ZCode
-                            CAN write files either way. --mode instead tells ZCode's own agent how
+                            NOT this plugin's write permission — review and unscoped code pass
+                            permissionPolicy: "allow" to runTurn, with or without --mode. Scoped
+                            code applies its path policy separately. With a scope, only build and plan
+                            are supported: edit/yolo approve writes themselves before the policy runs.
+                            Omit --mode to use build explicitly. --mode tells ZCode's own agent how
                             to behave once it has that permission: "plan" makes it propose a plan
                             without touching files, "edit" restricts it to editing existing files,
                             "yolo" skips its own internal confirmations, "build" is its default.
                             Defaults to whatever ZCode's own session default is when omitted.
+  --allow <glob>           Repeatable write scope for code: permit path-bearing tools only under this
+                            cwd-relative glob. Bash remains allowed and can bypass this scope.
+  --deny <glob>            Repeatable cwd-relative glob denied to path-bearing tools; takes precedence
+                            over --allow. Only --mode build or plan is compatible with a scope.
   --quiet                   Suppress per-step progress and summary on stderr (state changes,
                             tool calls, streaming text); print only the final response/footer
                             (code/review only)
@@ -529,7 +538,7 @@ export function makeOnProgress(write, { quiet = false, noStream = false, cwd = p
           write(event.delta);
         }
       } else if (event.kind === "tool_call") {
-        if (journal) journal.recordToolCall(event.toolName, event.input);
+        if (journal) journal.recordToolCall(event.toolName, event.input, event.toolCallId);
         const line = formatToolCallLine(event, cwd);
         if (line) write(`\n${line}\n`);
       }
@@ -546,7 +555,7 @@ export function makeOnProgress(write, { quiet = false, noStream = false, cwd = p
       const safeModel = typeof modelId === "string" && modelId ? modelId : null;
       const safeMode = typeof mode === "string" && mode ? mode : null;
       if (safeModel || safeMode) {
-        const key = `${safeModel ?? ""}::${safeMode ?? ""}`;
+        const key = JSON.stringify([safeModel, safeMode]);
         if (key === lastStateKey) return;
         lastStateKey = key;
         const parts = [];
@@ -777,6 +786,13 @@ function printChangesSummary(gitSnapshot, cwd, journal, logError, diffSnapshots,
   }
 }
 
+/** @param {string | string[] | boolean | undefined} value */
+function asScopePatterns(value) {
+  if (value === undefined) return [];
+  const values = Array.isArray(value) ? value : [value];
+  return values.map((item) => String(item).trim()).filter(Boolean);
+}
+
 async function handleCode(argv, deps, log, logError) {
   const {
     resolveZcodeCli: resolveCli,
@@ -788,6 +804,7 @@ async function handleCode(argv, deps, log, logError) {
   } = resolveDeps(deps);
   const { options, positionals } = parseCompanionArgs(argv, {
     valueOptions: ["cwd", "model", "timeout", "mode"],
+    repeatableValueOptions: ["allow", "deny"],
     booleanOptions: ["quiet", "no-stream"],
   });
 
@@ -802,7 +819,17 @@ async function handleCode(argv, deps, log, logError) {
   const cwd = resolveCwd(options);
   const model = parseModelFlag(options.model) ?? DEFAULT_CODE_MODEL;
   const timeoutMs = parseTimeoutFlag(options.timeout) ?? DEFAULT_CODE_TIMEOUT_SECONDS * 1000;
-  const mode = parseModeFlag(options.mode) ?? undefined;
+  const requestedMode = parseModeFlag(options.mode);
+  const allow = asScopePatterns(options.allow);
+  const deny = asScopePatterns(options.deny);
+  const hasWriteScope = allow.length > 0 || deny.length > 0;
+  if (hasWriteScope && (requestedMode === "edit" || requestedMode === "yolo")) {
+    throw new UsageError(
+      `--allow/--deny cannot be used with --mode ${requestedMode}: ZCode approves writes itself in these modes, ` +
+        "so the write scope cannot be enforced. Use --mode build or --mode plan, or omit --mode to use build.",
+    );
+  }
+  const mode = hasWriteScope ? requestedMode ?? "build" : requestedMode ?? undefined;
   const cli = resolveCli();
   const prompt = buildCodePrompt({ task, cwd });
 
@@ -812,6 +839,21 @@ async function handleCode(argv, deps, log, logError) {
   const isQuiet = Boolean(options.quiet);
   const gitSnapshot = isQuiet ? null : captureSnapshot(cwd);
   const journal = isQuiet ? null : createJournal(cwd);
+  const permissionPolicy = hasWriteScope
+    ? createWriteScopePolicy({
+        cwd,
+        allow,
+        deny,
+        onDenied: ({ toolCallId, path: deniedPath }) => journal?.recordDeniedToolCall(toolCallId, deniedPath),
+      })
+    : "allow";
+
+  if (hasWriteScope) {
+    logError(
+      `[zcode] write scope enabled: allow=${allow.length > 0 ? allow.join(", ") : "(all inside cwd)"}; ` +
+        `deny=${deny.length > 0 ? deny.join(", ") : "(none)"}; path-bearing tools only, Bash is not restricted\n`,
+    );
+  }
 
   let result;
   try {
@@ -836,7 +878,7 @@ async function handleCode(argv, deps, log, logError) {
       // defect this fix closes — see the module doc comment above). The
       // owner accepted this because `code` always runs inside a git
       // repository, where any write it makes can be reviewed and reverted.
-      // NOTE: this is unconditional — `--mode` (above) does not change it.
+      // NOTE: `--mode` (above) does not change this policy choice.
       // `--mode` is ZCode's own agent-behavior mode; permissionPolicy is this
       // plugin's own decision about whether to auto-answer ZCode's
       // permission prompts. See ZCODE_MODES's doc comment for why these must
@@ -844,7 +886,7 @@ async function handleCode(argv, deps, log, logError) {
       // permissionPolicy: "allow", it is ZCode's own plan-mode behavior
       // (propose without touching files) that keeps it from writing, not a
       // denial from this plugin.
-      permissionPolicy: "allow",
+      permissionPolicy,
     });
   } catch (err) {
     // Requirement 3: summarize first (best-effort, never changes exit code),
