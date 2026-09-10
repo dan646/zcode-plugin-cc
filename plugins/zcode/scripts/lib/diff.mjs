@@ -52,6 +52,7 @@ export const FILE_WRITING_TOOLS = Object.freeze(["Write", "Edit"]);
  * outside the target repo, and resolving against the wrong one makes this
  * run's own writes land in the "not by this run" part of the summary.
  * @param {string} cwd absolute working directory of the run
+ * @param {{ onActualWritesChanged?: (info: { count: number, lastWriteAt: number | null }) => void }} [options]
  * @returns {{
  *   writtenFiles: Set<string>,
  *   deniedFiles: Set<string>,
@@ -60,12 +61,22 @@ export const FILE_WRITING_TOOLS = Object.freeze(["Write", "Edit"]);
  *   recordDeniedToolCall(toolCallId: unknown, absPath: string): void,
  * }}
  */
-export function createFileJournal(cwd = process.cwd()) {
+export function createFileJournal(cwd = process.cwd(), { onActualWritesChanged } = {}) {
   const writtenFiles = new Set();
   const deniedFiles = new Set();
   const bashCommands = [];
   const writeAttempts = new Map();
   let anonymousWriteId = 0;
+  const reportActualWrites = () => {
+    const actual = [...writeAttempts.values()].filter((attempt) => !attempt.denied);
+    const lastWriteAt = actual.reduce((latest, attempt) => Math.max(latest, attempt.at), 0) || null;
+    try {
+      onActualWritesChanged?.({ count: actual.length, lastWriteAt });
+    } catch {
+      // Journal observers drive optional CLI progress only. A faulty observer
+      // must not change the journal or interrupt a turn.
+    }
+  };
   const refreshWrittenPath = (absPath) => {
     const hasAllowedAttempt = [...writeAttempts.values()].some((attempt) => attempt.path === absPath && !attempt.denied);
     if (hasAllowedAttempt) writtenFiles.add(absPath);
@@ -81,8 +92,9 @@ export function createFileJournal(cwd = process.cwd()) {
         if (typeof fp === "string" && fp.trim()) {
           const absPath = path.resolve(cwd, fp);
           const id = toolCallId ?? `anonymous-write-${anonymousWriteId++}`;
-          writeAttempts.set(id, { path: absPath, denied: false });
+          writeAttempts.set(id, { path: absPath, denied: false, at: Date.now() });
           refreshWrittenPath(absPath);
+          reportActualWrites();
         }
       } else if (toolName === "Bash") {
         const cmd = input?.command;
@@ -94,8 +106,16 @@ export function createFileJournal(cwd = process.cwd()) {
       if (attempt) {
         attempt.denied = true;
         refreshWrittenPath(attempt.path);
+        reportActualWrites();
       }
       if (typeof absPath === "string" && absPath) deniedFiles.add(absPath);
+    },
+    getActualWriteInfo() {
+      const actual = [...writeAttempts.values()].filter((attempt) => !attempt.denied);
+      return {
+        count: actual.length,
+        lastWriteAt: actual.reduce((latest, attempt) => Math.max(latest, attempt.at), 0) || null,
+      };
     },
   };
 }

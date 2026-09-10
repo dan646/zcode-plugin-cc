@@ -360,15 +360,21 @@ describe("runTurn — mid-turn failure cleanup", () => {
 
 describe("runTurn — timeout", () => {
   test("rejects with a clear message once timeoutMs elapses", { timeout: 5000 }, async () => {
-    await assert.rejects(
-      runTurn({
-        cli: FIXTURE_CLI,
-        workspace: scenarioWorkspace("timeout"),
-        prompt: "hi",
-        timeoutMs: 150,
-      }),
-      /timed out after 150ms/,
-    );
+    const callSpy = spyOnCalls();
+    try {
+      await assert.rejects(
+        runTurn({
+          cli: FIXTURE_CLI,
+          workspace: scenarioWorkspace("timeout"),
+          prompt: "hi",
+          timeoutMs: 150,
+        }),
+        /timed out after 150ms/,
+      );
+      assert.ok(callSpy.calls.some((call) => call.method === "session/stop"), "timeout must stop the remote turn");
+    } finally {
+      callSpy.restore();
+    }
   });
 });
 
@@ -492,6 +498,7 @@ describe("runTurn — cancellation", () => {
         prompt: "hi",
         signal: controller.signal,
         cancelGraceMs: 300,
+        timeoutMs: 1000,
       });
       setTimeout(() => controller.abort(), 40);
 
@@ -760,6 +767,33 @@ describe("runTurn — heartbeat (active liveness self-check)", () => {
     });
     assert.equal(result.resultType, "completed");
     assert.equal(result.response, "Hello!");
+  });
+});
+
+describe("runTurn — externally stopped turns", () => {
+  test("a turn with a Write tool call follows AbortSignal through session/stop", { timeout: 5000 }, async () => {
+    const controller = new AbortController();
+    const progressEvents = [];
+    const callSpy = spyOnCalls();
+    try {
+      const result = await runTurn({
+        cli: FIXTURE_CLI,
+        workspace: scenarioWorkspace("write-stop"),
+        prompt: "hi",
+        signal: controller.signal,
+        timeoutMs: 1000,
+        onProgress: (event) => {
+          progressEvents.push(event);
+          if (event.kind === "tool_call" && event.toolName === "Write") controller.abort();
+        },
+      });
+      assert.equal(result.resultType, "cancelled");
+      assert.ok(progressEvents.some((event) => event.kind === "text_delta" && event.delta === "unfinished visible response"));
+      assert.ok(progressEvents.some((event) => event.kind === "tool_call" && event.toolName === "Write"));
+      assert.ok(callSpy.calls.some((call) => call.method === "session/stop"));
+    } finally {
+      callSpy.restore();
+    }
   });
 });
 

@@ -28,6 +28,7 @@ import {
   runCli,
   parseModelFlag,
   parseTimeoutFlag,
+  parsePositiveSecondsFlag,
   parseModeFlag,
   formatToolCallLine,
   summarizeToolCallInput,
@@ -39,6 +40,8 @@ import {
   EXIT_OK,
   EXIT_ERROR,
   EXIT_TURN_FAILED,
+  EXIT_STOPPED_WITHOUT_WRITES,
+  EXIT_STOPPED_WITH_WRITES,
 } from "../plugins/zcode/scripts/zcode-companion.mjs";
 import { formatDisplayPath, canonicalizePath } from "../plugins/zcode/scripts/lib/paths.mjs";
 
@@ -46,6 +49,10 @@ import { formatDisplayPath, canonicalizePath } from "../plugins/zcode/scripts/li
 // percent-encoded, so a checkout path with a space or non-ASCII character
 // would otherwise silently break every template-loading assertion below.
 const ROOT_DIR = fileURLToPath(new URL("../plugins/zcode", import.meta.url));
+const TEST_APP_SERVER_CLI = {
+  command: process.execPath,
+  args: [fileURLToPath(new URL("./fake-app-server.mjs", import.meta.url))],
+};
 
 // ---------------------------------------------------------------- fixtures
 
@@ -493,6 +500,18 @@ describe("parseTimeoutFlag", () => {
   for (const bad of ["0", "-5", "abc", "", "   ", "NaN", "Infinity"]) {
     test(`rejects invalid value: ${JSON.stringify(bad)}`, () => {
       assert.throws(() => parseTimeoutFlag(bad), /--timeout must be a positive number of seconds/);
+    });
+  }
+});
+
+describe("parsePositiveSecondsFlag", () => {
+  test("converts a positive seconds value to milliseconds", () => {
+    assert.equal(parsePositiveSecondsFlag("1.5", "--idle-after-write"), 1500);
+  });
+
+  for (const bad of ["0", "-1", "abc", ""]) {
+    test(`rejects invalid ${JSON.stringify(bad)}`, () => {
+      assert.throws(() => parsePositiveSecondsFlag(bad, "--max-tool-calls"), /must be a positive number/);
     });
   }
 });
@@ -1313,7 +1332,7 @@ describe("runCli — code / review success and failure paths (runTurn stubbed)",
     assert.match(sinks.stderr(), /запросов 4 \(\+1\)/);
   });
 
-  test("a runTurn timeout error is enhanced with the wait time and a --timeout suggestion", async () => {
+  test("a runTurn timeout is a stopped turn, not a companion error", async () => {
     const sinks = makeSinks();
     const code = await runCli(["code", "do", "something", "--timeout", "5"], {
       ...sinks,
@@ -1324,40 +1343,207 @@ describe("runCli — code / review success and failure paths (runTurn stubbed)",
         );
       },
     });
-    assert.equal(code, EXIT_ERROR);
-    // Both the human-facing seconds figure and the flag to raise it with
-    // must be present — a bare "timed out" message leaves the user stuck.
-    assert.match(sinks.stderr(), /Waited 5s/);
-    assert.match(sinks.stderr(), /--timeout/);
-    // A small timeout doubling to a slightly bigger one is still a sensible
-    // suggestion (5s -> 10s), unlike doubling a large one (see the test below).
-    assert.match(sinks.stderr(), /--timeout 10\b/);
+    assert.equal(code, EXIT_STOPPED_WITHOUT_WRITES);
+    assert.match(sinks.stderr(), /сработал таймаут после 5000ms/);
+    assert.match(sinks.stderr(), /записей не было/);
   });
 
-  test("a timeout error above the doubling ceiling suggests a +50% bump, not a doubled value", async () => {
-    // Regression guard for the new default (`code` = 2700s / 45min): doubling
-    // an already-large timeout (e.g. suggesting 5400s/90min) reads as an
-    // absurd ask. Past `TIMEOUT_DOUBLING_CEILING_SECONDS`, the suggestion
-    // must scale down to +50% instead of blindly doubling.
+  test("a timeout after a Write maps to the partial-work exit code", async () => {
     const sinks = makeSinks();
     const code = await runCli(["code", "do", "something", "--timeout", "2700"], {
       ...sinks,
       resolveZcodeCli: fakeResolveZcodeCli,
-      runTurn: async () => {
+      runTurn: async (args) => {
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_call",
+          toolCallId: "write-before-timeout",
+          toolName: "Write",
+          input: { file_path: "src/before-timeout.mjs", content: "x" },
+        });
         throw new Error(
           "ZCode turn timed out after 2700000ms waiting for turn.completed/turn.failed (sessionId=s1).",
         );
       },
     });
-    assert.equal(code, EXIT_ERROR);
-    assert.match(sinks.stderr(), /Waited 2700s/);
-    // 2700 * 1.5 = 4050 — NOT 5400 (a blind doubling).
-    assert.match(sinks.stderr(), /--timeout 4050\b/);
-    assert.doesNotMatch(sinks.stderr(), /--timeout 5400\b/);
+    assert.equal(code, EXIT_STOPPED_WITH_WRITES);
+    assert.match(sinks.stderr(), /сработал таймаут после 2700000ms/);
+  });
+
+  test("an idle-after-write stop returns code 4 and prints only accumulated text_delta", { timeout: 1000 }, async () => {
+    const sinks = makeSinks();
+    const code = await runCli(["code", "do", "something", "--idle-after-write", "0.02"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({ type: "model.streaming", kind: "reasoning_delta", delta: "private reasoning" });
+        args.onProgress({ type: "model.streaming", kind: "text_delta", delta: "partial answer" });
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_call",
+          toolCallId: "write-1",
+          toolName: "Write",
+          input: { file_path: "src/a.mjs", content: "x" },
+        });
+        await new Promise((resolve) => args.signal.addEventListener("abort", resolve, { once: true }));
+        return fakeTurnResult({ resultType: "cancelled", response: null });
+      },
+    });
+    assert.equal(code, EXIT_STOPPED_WITH_WRITES);
+    assert.match(sinks.stderr(), /простой после записи/);
+    assert.match(sinks.stdout(), /Незавершённый ответ модели/);
+    assert.match(sinks.stdout(), /partial answer/);
+    assert.doesNotMatch(sinks.stdout(), /private reasoning/);
+  });
+
+  test("idle-after-write does not stop a turn that has not written a file", { timeout: 1000 }, async () => {
+    const sinks = makeSinks();
+    const code = await runCli(["code", "do", "something", "--idle-after-write", "0.02"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+        assert.equal(args.signal.aborted, false);
+        return fakeTurnResult();
+      },
+    });
+    assert.equal(code, EXIT_OK);
+  });
+
+  for (const [flag, values] of [
+    ["--idle-after-write", ["0", "-1", "abc"]],
+    ["--max-tool-calls", ["0", "-1", "abc"]],
+  ]) {
+    for (const value of values) {
+      test(`${flag} rejects ${JSON.stringify(value)} before starting a turn`, async () => {
+        const sinks = makeSinks();
+        let called = false;
+        const code = await runCli(["code", "do", "something", `${flag}=${value}`], {
+          ...sinks,
+          resolveZcodeCli: fakeResolveZcodeCli,
+          runTurn: async () => {
+            called = true;
+            return fakeTurnResult();
+          },
+        });
+        assert.equal(code, EXIT_ERROR);
+        assert.equal(called, false);
+      });
+    }
+  }
+
+  test("max-tool-calls counts denied calls and returns code 3 when none were actual writes", async () => {
+    const sinks = makeSinks();
+    const code = await runCli(["code", "do", "something", "--allow", "src/**", "--max-tool-calls", "1"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({
+          type: "model.streaming",
+          kind: "tool_call",
+          toolCallId: "denied-write",
+          toolName: "Write",
+          input: { file_path: "docs/outside.txt", content: "x" },
+        });
+        args.permissionPolicy.decide({
+          toolCallId: "denied-write",
+          toolName: "Write",
+          input: { file_path: "docs/outside.txt", content: "x" },
+        });
+        args.onProgress({ type: "model.streaming", kind: "tool_call", toolName: "Read", input: { file_path: "README.md" } });
+        assert.equal(args.signal.aborted, true);
+        return fakeTurnResult({ resultType: "cancelled", response: null });
+      },
+    });
+    assert.equal(code, EXIT_STOPPED_WITHOUT_WRITES);
+    assert.match(sinks.stderr(), /лимит вызовов инструментов.*2/);
+  });
+
+  test("`code --quiet` retains accepted writes for a stopped turn's exit code", { timeout: 2_000 }, async () => {
+    const sinks = makeSinks();
+    // Deliberately use the real runTurn: the fixture emits Write before two
+    // later Read calls take this turn over --max-tool-calls.
+    const code = await runCli(
+      ["code", "stop", "after", "a", "write", "--cwd", "/scenario/many-tools-stop", "--quiet", "--max-tool-calls", "1", "--timeout", "1"],
+      {
+        ...sinks,
+        resolveZcodeCli: () => TEST_APP_SERVER_CLI,
+      },
+    );
+
+    assert.equal(code, EXIT_STOPPED_WITH_WRITES);
+    assert.match(sinks.stderr(), /лимит вызовов инструментов/);
+  });
+
+  test("a denied Write does not leave idle-after-write armed", { timeout: 2_000 }, async () => {
+    const sinks = makeSinks();
+    // The fixture emits Write first, then asks permission for that same call.
+    // Its delayed completion is longer than the idle threshold, so this only
+    // succeeds if denying the request clears the tentative write timestamp.
+    const code = await runCli(
+      [
+        "code",
+        "wait",
+        "for",
+        "permission",
+        "--cwd",
+        "/scenario/denied-write-idle",
+        "--allow",
+        "src/**",
+        "--idle-after-write",
+        "0.05",
+        "--quiet",
+        "--timeout",
+        "1",
+      ],
+      {
+        ...sinks,
+        resolveZcodeCli: () => TEST_APP_SERVER_CLI,
+      },
+    );
+
+    assert.equal(code, EXIT_OK);
+    assert.doesNotMatch(sinks.stderr(), /простой после записи/);
+  });
+
+  test("a timeout is a stopped turn, preserves the text tail, and is not companion error code 1", async () => {
+    const sinks = makeSinks();
+    const code = await runCli(["code", "do", "something", "--no-stream", "--timeout", "0.02"], {
+      ...sinks,
+      resolveZcodeCli: fakeResolveZcodeCli,
+      runTurn: async (args) => {
+        args.onProgress({ type: "model.streaming", kind: "reasoning_delta", delta: "do not show" });
+        args.onProgress({
+          type: "model.streaming",
+          kind: "text_delta",
+          delta: "start-" + "x".repeat(20_000) + '-{"apiKey":"top-secret"}-tail',
+        });
+        throw new Error("ZCode turn timed out after 20ms waiting for turn.completed/turn.failed (sessionId=s1).");
+      },
+    });
+    assert.equal(code, EXIT_STOPPED_WITHOUT_WRITES);
+    assert.match(sinks.stderr(), /сработал таймаут.*20ms/);
+    assert.match(sinks.stdout(), /-tail/);
+    assert.doesNotMatch(sinks.stdout(), /start-/);
+    assert.doesNotMatch(sinks.stdout(), /do not show/);
+    assert.doesNotMatch(sinks.stdout(), /top-secret/);
+    assert.match(sinks.stdout(), /\[REDACTED\]/);
   });
 });
 
 describe("makeOnProgress — progress callback and flags", () => {
+  test("separates text deltas from distinct assistant messages", () => {
+    const lines = [];
+    const onProgress = makeOnProgress((text) => lines.push(text));
+
+    onProgress({ type: "model.streaming", kind: "text_delta", assistantMessageId: "m1", delta: "first" });
+    onProgress({ type: "model.streaming", kind: "text_delta", assistantMessageId: "m1", delta: " message" });
+    assert.equal(lines.join(""), "first message");
+
+    onProgress({ type: "model.streaming", kind: "text_delta", assistantMessageId: "m2", delta: "second message" });
+    assert.equal(lines.join(""), "first message\nsecond message");
+  });
+
   test("emits distinct lines for multiple sequential tool calls", () => {
     const lines = [];
     const onProgress = makeOnProgress((text) => lines.push(text), { cwd: "/repo" });
@@ -1411,6 +1597,24 @@ describe("makeOnProgress — progress callback and flags", () => {
     assert.doesNotMatch(combined, /streamed response/);
     assert.match(combined, /tool: Write a\.txt/);
     assert.match(combined, /жив/);
+  });
+
+  test("heartbeat says whether an accepted file write has happened", () => {
+    const lines = [];
+    const journal = createFileJournal("/repo");
+    const onProgress = makeOnProgress((text) => lines.push(text), { cwd: "/repo", journal });
+    onProgress({ type: "heartbeat", elapsedMs: 60_000, alive: true, stalled: false });
+    onProgress({
+      type: "model.streaming",
+      kind: "tool_call",
+      toolCallId: "accepted-write",
+      toolName: "Write",
+      input: { file_path: "src/a.mjs", content: "x" },
+    });
+    onProgress({ type: "heartbeat", elapsedMs: 61_000, alive: true, stalled: false });
+    const combined = lines.join("");
+    assert.match(combined, /записей ещё не было/);
+    assert.match(combined, /последняя запись 0m00s назад/);
   });
 });
 

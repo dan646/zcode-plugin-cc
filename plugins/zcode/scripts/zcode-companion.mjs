@@ -118,6 +118,10 @@ export const EXIT_OK = 0;
 export const EXIT_ERROR = 1;
 /** Exit code used specifically for a `turn.failed` result (see `lib/session.mjs`'s `runTurn`). */
 export const EXIT_TURN_FAILED = 2;
+/** Turn was stopped before any non-denied file-writing tool call. */
+export const EXIT_STOPPED_WITHOUT_WRITES = 3;
+/** Turn was stopped after at least one non-denied file-writing tool call. */
+export const EXIT_STOPPED_WITH_WRITES = 4;
 
 const USAGE_TEXT = `Usage: zcode-companion <command> [options]
 
@@ -132,6 +136,12 @@ Common options:
   --cwd <path>              Working directory (default: current directory)
   --json                    Machine-readable output (setup, status)
   --timeout <seconds>       Turn timeout in seconds (code/review only; defaults: code=${DEFAULT_CODE_TIMEOUT_SECONDS}, review=${DEFAULT_REVIEW_TIMEOUT_SECONDS})
+  --idle-after-write <seconds>
+                            Stop code/review after this long with no new accepted Write/Edit call.
+                            Disabled by default. Set it longer than this project's slowest tests and
+                            linters: a long Bash test run is indistinguishable from idle reading.
+  --max-tool-calls <n>      Stop code/review after more than n declared tool calls. Disabled by default;
+                            rejected calls are counted too.
   --mode <${ZCODE_MODES.join("|")}>
                             ZCode's own operating mode for this turn (code/review only). This is
                             NOT this plugin's write permission — review and unscoped code pass
@@ -269,6 +279,33 @@ export function parseTimeoutFlag(raw) {
     throw new UsageError(`--timeout must be a positive number of seconds, got: ${JSON.stringify(raw)}`);
   }
   return Math.round(seconds * 1000);
+}
+
+/** Parse a positive seconds value for an optional turn stop condition. */
+export function parsePositiveSecondsFlag(raw, flagName) {
+  if (raw === undefined) return null;
+  if (raw === true || raw === false) {
+    throw new UsageError(`${flagName} requires a numeric value, got: ${raw}`);
+  }
+  const trimmed = String(raw).trim();
+  const value = Number(trimmed);
+  if (trimmed === "" || !Number.isFinite(value) || value <= 0) {
+    throw new UsageError(`${flagName} must be a positive number, got: ${JSON.stringify(raw)}`);
+  }
+  return Math.max(1, Math.round(value * 1000));
+}
+
+function parseMaxToolCallsFlag(raw) {
+  if (raw === undefined) return null;
+  if (raw === true || raw === false) {
+    throw new UsageError(`--max-tool-calls requires a numeric value, got: ${raw}`);
+  }
+  const text = String(raw).trim();
+  const value = Number(text);
+  if (text === "" || !Number.isFinite(value) || value <= 0 || !Number.isInteger(value)) {
+    throw new UsageError(`--max-tool-calls must be a positive whole number, got: ${JSON.stringify(raw)}`);
+  }
+  return value;
 }
 
 /** @param {any} usage `turn.completed.payload.usage` or `session/usage`'s result — see lib/session.mjs */
@@ -474,17 +511,22 @@ function formatTokenCount(n) {
  * @param {any} event a `{type: "heartbeat", ...}` progress event from `runTurn`
  * @returns {string | null}
  */
-export function formatHeartbeatLine(event) {
+export function formatHeartbeatLine(event, actualWrites = null) {
   if (!event || event.type !== "heartbeat") return null;
   const elapsed = formatDurationMs(event.elapsedMs ?? 0);
+  const lastWriteAt = actualWrites?.lastWriteAt;
+  const writeStatus =
+    typeof lastWriteAt === "number"
+      ? ` · последняя запись ${formatDurationMs(Date.now() - lastWriteAt)} назад`
+      : " · записей ещё не было";
 
   if (!event.alive) {
-    return `[zcode] ${elapsed} · нет ответа от ZCode (зонд не отвечает, ${event.consecutiveFailedProbes} подряд) — жду`;
+    return `[zcode] ${elapsed} · нет ответа от ZCode (зонд не отвечает, ${event.consecutiveFailedProbes} подряд) — жду${writeStatus}`;
   }
 
   if (event.stalled) {
     const stalledFor = formatDurationMs(event.sinceLastProgressMs ?? 0);
-    return `[zcode] ${elapsed} · жив · без прогресса ${stalledFor} — модель думает`;
+    return `[zcode] ${elapsed} · жив · без прогресса ${stalledFor} — модель думает${writeStatus}`;
   }
 
   const parts = [];
@@ -503,7 +545,7 @@ export function formatHeartbeatLine(event) {
     parts.push(`токенов ${formatTokenCount(event.totalTokens)}${delta}`);
   }
 
-  return `[zcode] ${elapsed} · жив${parts.length > 0 ? " · " + parts.join(" · ") : ""}`;
+  return `[zcode] ${elapsed} · жив${parts.length > 0 ? " · " + parts.join(" · ") : ""}${writeStatus}`;
 }
 
 /**
@@ -522,27 +564,47 @@ export function formatHeartbeatLine(event) {
  * two-part changes summary. Recording is skipped when there is no journal
  * (i.e. under `--quiet`) — no point building a summary that won't be printed.
  * @param {(text: string) => void} write
- * @param {{ quiet?: boolean, noStream?: boolean, cwd?: string, journal?: import("./lib/diff.mjs").ReturnType<typeof createFileJournal> | null }} [options]
+ * @param {{ quiet?: boolean, noStream?: boolean, cwd?: string, journal?: import("./lib/diff.mjs").ReturnType<typeof createFileJournal> | null, onTextDelta?: ((delta: string) => void) | null, onToolCall?: ((event: any) => void) | null }} [options]
  */
-export function makeOnProgress(write, { quiet = false, noStream = false, cwd = process.cwd(), journal = null } = {}) {
-  if (quiet) return () => {};
+export function makeOnProgress(
+  write,
+  { quiet = false, noStream = false, cwd = process.cwd(), journal = null, onTextDelta = null, onToolCall = null } = {},
+) {
   // Track the last printed model/mode pair so we don't emit the same startup
   // line twice — the server frequently sends two identical `state.updated`
   // events (e.g. "model=glm-5.3-flash mode=build" at turn start), which would
   // otherwise print the line twice on stderr.
   let lastStateKey = null;
+  // A model may begin a new assistant message after a tool call. Its text
+  // deltas are independent from the prior message, so keep them readable in
+  // both streamed output and the accumulated stopped-turn text.
+  let lastTextAssistantMessageId = null;
   return (event) => {
     if (event.type === "model.streaming") {
       if ((event.kind === "text_delta" || event.kind === "reasoning_delta") && typeof event.delta === "string" && event.delta) {
-        if (!noStream) {
-          write(event.delta);
+        const assistantMessageId = event.assistantMessageId;
+        const startsNewTextMessage =
+          event.kind === "text_delta" &&
+          typeof assistantMessageId === "string" &&
+          lastTextAssistantMessageId !== null &&
+          assistantMessageId !== lastTextAssistantMessageId;
+        if (event.kind === "text_delta" && typeof assistantMessageId === "string") {
+          lastTextAssistantMessageId = assistantMessageId;
+        }
+        const text = `${startsNewTextMessage ? "\n" : ""}${event.delta}`;
+        if (event.kind === "text_delta") onTextDelta?.(text);
+        if (!quiet && !noStream) {
+          write(text);
         }
       } else if (event.kind === "tool_call") {
         if (journal) journal.recordToolCall(event.toolName, event.input, event.toolCallId);
+        onToolCall?.(event);
+        if (quiet) return;
         const line = formatToolCallLine(event, cwd);
         if (line) write(`\n${line}\n`);
       }
     } else if (event.type === "state.updated") {
+      if (quiet) return;
       // Prefer showing concrete values (model id / mode) from the patch over
       // the bare reason string — "model_changed" says nothing a user can act
       // on, "model=glm-5.3-flash" does. Print nothing when there is no value.
@@ -566,7 +628,8 @@ export function makeOnProgress(write, { quiet = false, noStream = false, cwd = p
         write(`\n${redactSecrets(`[zcode] ${event.reason}`)}\n`);
       }
     } else if (event.type === "heartbeat") {
-      const line = formatHeartbeatLine(event);
+      if (quiet) return;
+      const line = formatHeartbeatLine(event, journal?.getActualWriteInfo?.());
       if (line) write(`\n${line}\n`);
     }
   };
@@ -793,6 +856,102 @@ function asScopePatterns(value) {
   return values.map((item) => String(item).trim()).filter(Boolean);
 }
 
+const INTERRUPTED_TEXT_TAIL_LIMIT = 16_000;
+
+function appendTextTail(current, delta) {
+  let next = current + delta;
+  if (next.length <= INTERRUPTED_TEXT_TAIL_LIMIT) return next;
+  next = next.slice(-INTERRUPTED_TEXT_TAIL_LIMIT);
+  // Prefer the start of the next word when possible, while preserving a
+  // useful tail even for a very long unbroken token or source line.
+  const boundary = next.search(/\s/);
+  return boundary >= 0 && boundary < 512 ? next.slice(boundary + 1) : next;
+}
+
+/**
+ * Owns companion-level stop limits. `runTurn` remains the one place that
+ * performs cancellation: this controller is passed to it as an AbortSignal,
+ * so every early stop follows its session/stop and grace-period path.
+ */
+function createTurnStopController({ idleAfterWriteMs, maxToolCalls }) {
+  const controller = new AbortController();
+  let reason = null;
+  let toolCallCount = 0;
+  let lastWriteInfo = { count: 0, lastWriteAt: null };
+  let idleTimer = null;
+
+  const stop = (nextReason) => {
+    if (reason) return;
+    reason = nextReason;
+    controller.abort();
+  };
+  const scheduleIdleStop = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = null;
+    if (!idleAfterWriteMs || typeof lastWriteInfo.lastWriteAt !== "number") return;
+    const observedWriteAt = lastWriteInfo.lastWriteAt;
+    const remainingMs = Math.max(0, idleAfterWriteMs - (Date.now() - observedWriteAt));
+    idleTimer = setTimeout(() => {
+      if (lastWriteInfo.lastWriteAt !== observedWriteAt) return;
+      stop({ type: "idle-after-write", idleAfterWriteMs, lastWriteAt: observedWriteAt });
+    }, remainingMs);
+    idleTimer.unref?.();
+  };
+
+  return {
+    signal: controller.signal,
+    get reason() {
+      return reason;
+    },
+    get toolCallCount() {
+      return toolCallCount;
+    },
+    onActualWritesChanged(info) {
+      lastWriteInfo = info;
+      scheduleIdleStop();
+    },
+    onToolCall() {
+      toolCallCount += 1;
+      if (maxToolCalls && toolCallCount > maxToolCalls) {
+        stop({ type: "max-tool-calls", maxToolCalls, toolCallCount });
+      }
+    },
+    stopForTimeout(timeoutMs) {
+      stop({ type: "timeout", timeoutMs });
+    },
+    dispose() {
+      if (idleTimer) clearTimeout(idleTimer);
+    },
+  };
+}
+
+function formatLastWriteStatus(lastWriteAt) {
+  return typeof lastWriteAt === "number"
+    ? `последняя запись ${formatDurationMs(Date.now() - lastWriteAt)} назад`
+    : "записей не было";
+}
+
+function renderStoppedTurnReason(reason, { toolCallCount, lastWriteAt }) {
+  const common = `объявлено вызовов ${toolCallCount}; ${formatLastWriteStatus(lastWriteAt)}`;
+  if (reason.type === "idle-after-write") {
+    return `[zcode] ход остановлен: сработал простой после записи ${reason.idleAfterWriteMs}ms; ${common}\n`;
+  }
+  if (reason.type === "max-tool-calls") {
+    return `[zcode] ход остановлен: сработал лимит вызовов инструментов ${reason.maxToolCalls}; объявлено ${reason.toolCallCount}; ${formatLastWriteStatus(lastWriteAt)}\n`;
+  }
+  return `[zcode] ход остановлен: сработал таймаут после ${reason.timeoutMs}ms; ${common}\n`;
+}
+
+function printInterruptedResponse(log, textTail) {
+  const text = redactSecrets(capDiagText(textTail, INTERRUPTED_TEXT_TAIL_LIMIT)).trim();
+  log("[zcode] Незавершённый ответ модели (ход остановлен; это не итоговое резюме):\n");
+  if (text) log(`${text}\n`);
+}
+
+function stoppedExitCode(journal) {
+  return (journal?.getActualWriteInfo?.().count ?? 0) > 0 ? EXIT_STOPPED_WITH_WRITES : EXIT_STOPPED_WITHOUT_WRITES;
+}
+
 async function handleCode(argv, deps, log, logError) {
   const {
     resolveZcodeCli: resolveCli,
@@ -803,7 +962,7 @@ async function handleCode(argv, deps, log, logError) {
     renderJournaledChangesSummary: renderSummary,
   } = resolveDeps(deps);
   const { options, positionals } = parseCompanionArgs(argv, {
-    valueOptions: ["cwd", "model", "timeout", "mode"],
+    valueOptions: ["cwd", "model", "timeout", "mode", "idle-after-write", "max-tool-calls"],
     repeatableValueOptions: ["allow", "deny"],
     booleanOptions: ["quiet", "no-stream"],
   });
@@ -812,13 +971,16 @@ async function handleCode(argv, deps, log, logError) {
   if (!task) {
     throw new UsageError(
       "Usage: zcode-companion code <task description> [--model <id>] [--cwd <path>] " +
-        `[--timeout <seconds>] [--mode <${ZCODE_MODES.join("|")}>] [--quiet] [--no-stream]`,
+        `[--timeout <seconds>] [--idle-after-write <seconds>] [--max-tool-calls <n>] ` +
+        `[--mode <${ZCODE_MODES.join("|")}>] [--quiet] [--no-stream]`,
     );
   }
 
   const cwd = resolveCwd(options);
   const model = parseModelFlag(options.model) ?? DEFAULT_CODE_MODEL;
   const timeoutMs = parseTimeoutFlag(options.timeout) ?? DEFAULT_CODE_TIMEOUT_SECONDS * 1000;
+  const idleAfterWriteMs = parsePositiveSecondsFlag(options["idle-after-write"], "--idle-after-write");
+  const maxToolCalls = parseMaxToolCallsFlag(options["max-tool-calls"]);
   const requestedMode = parseModeFlag(options.mode);
   const allow = asScopePatterns(options.allow);
   const deny = asScopePatterns(options.deny);
@@ -833,12 +995,14 @@ async function handleCode(argv, deps, log, logError) {
   const cli = resolveCli();
   const prompt = buildCodePrompt({ task, cwd });
 
-  // --quiet suppresses per-step progress AND the changes summary — so don't
-  // bother capturing the git snapshot or building the journal at all
-  // (avoiding wasteful work for a summary that won't be printed).
+  // --quiet suppresses rendered progress and the changes summary. The journal
+  // still records activity for stop limits and exit-code classification.
   const isQuiet = Boolean(options.quiet);
+  const turnStop = createTurnStopController({ idleAfterWriteMs, maxToolCalls });
   const gitSnapshot = isQuiet ? null : captureSnapshot(cwd);
-  const journal = isQuiet ? null : createJournal(cwd);
+  // Keep the journal even under --quiet: it supplies the stop exit code and
+  // idle timer, while --quiet still suppresses only its rendered summary.
+  const journal = createJournal(cwd, { onActualWritesChanged: (info) => turnStop.onActualWritesChanged(info) });
   const permissionPolicy = hasWriteScope
     ? createWriteScopePolicy({
         cwd,
@@ -856,6 +1020,7 @@ async function handleCode(argv, deps, log, logError) {
   }
 
   let result;
+  let textTail = "";
   try {
     result = await runTurnFn({
       cli,
@@ -864,11 +1029,16 @@ async function handleCode(argv, deps, log, logError) {
       model,
       mode,
       timeoutMs,
+      signal: turnStop.signal,
       onProgress: makeOnProgress(logError, {
         quiet: Boolean(options.quiet),
         noStream: Boolean(options["no-stream"]),
         cwd,
         journal,
+        onTextDelta: (delta) => {
+          textTail = appendTextTail(textTail, delta);
+        },
+        onToolCall: () => turnStop.onToolCall(),
       }),
       // `runTurn`'s own default is "deny" (see lib/session.mjs) — a library
       // must not silently grant permissions. This call site opts into
@@ -894,10 +1064,30 @@ async function handleCode(argv, deps, log, logError) {
     // Requirement 7: print the summary even on turn failure — the model may
     // have written files before the turn failed, and that is exactly when
     // the summary is most useful.
+    if (isRunTurnTimeout(err)) turnStop.stopForTimeout(timeoutMs);
+    const stopReason = turnStop.reason;
+    turnStop.dispose();
+    if (stopReason) {
+      const writeInfo = journal.getActualWriteInfo();
+      logError(renderStoppedTurnReason(stopReason, { toolCallCount: turnStop.toolCallCount, lastWriteAt: writeInfo.lastWriteAt }));
+      printInterruptedResponse(log, textTail);
+      if (!isQuiet) printChangesSummary(gitSnapshot, cwd, journal, logError, diffSnapshots, renderSummary);
+      return stoppedExitCode(journal);
+    }
     if (!isQuiet) {
       printChangesSummary(gitSnapshot, cwd, journal, logError, diffSnapshots, renderSummary);
     }
     throw isRunTurnTimeout(err) ? toActionableTimeoutError(err, timeoutMs) : err;
+  }
+
+  const stopReason = turnStop.reason;
+  turnStop.dispose();
+  if (stopReason) {
+    const writeInfo = journal.getActualWriteInfo();
+    logError(renderStoppedTurnReason(stopReason, { toolCallCount: turnStop.toolCallCount, lastWriteAt: writeInfo.lastWriteAt }));
+    printInterruptedResponse(log, textTail);
+    if (!isQuiet) printChangesSummary(gitSnapshot, cwd, journal, logError, diffSnapshots, renderSummary);
+    return stoppedExitCode(journal);
   }
 
   log((typeof result.response === "string" ? result.response : JSON.stringify(result.response, null, 2)) + "\n");
@@ -919,7 +1109,7 @@ async function handleReview(argv, deps, log, logError) {
     renderJournaledChangesSummary: renderSummary,
   } = resolveDeps(deps);
   const { options, positionals } = parseCompanionArgs(argv, {
-    valueOptions: ["cwd", "model", "timeout", "mode"],
+    valueOptions: ["cwd", "model", "timeout", "mode", "idle-after-write", "max-tool-calls"],
     booleanOptions: ["quiet", "no-stream"],
   });
 
@@ -931,17 +1121,21 @@ async function handleReview(argv, deps, log, logError) {
 
   const model = parseModelFlag(options.model) ?? DEFAULT_REVIEW_MODEL;
   const timeoutMs = parseTimeoutFlag(options.timeout) ?? DEFAULT_REVIEW_TIMEOUT_SECONDS * 1000;
+  const idleAfterWriteMs = parsePositiveSecondsFlag(options["idle-after-write"], "--idle-after-write");
+  const maxToolCalls = parseMaxToolCallsFlag(options["max-tool-calls"]);
   const mode = parseModeFlag(options.mode) ?? undefined;
   const cli = resolveCli();
   const prompt = buildReviewPrompt({ diffInfo, cwd });
 
-  // --quiet suppresses per-step progress AND the changes summary — so don't
-  // bother capturing the git snapshot or building the journal at all.
+  // --quiet suppresses rendered progress and the changes summary. The journal
+  // still records activity for stop limits and exit-code classification.
   const isQuiet = Boolean(options.quiet);
+  const turnStop = createTurnStopController({ idleAfterWriteMs, maxToolCalls });
   const gitSnapshot = isQuiet ? null : captureSnapshot(cwd);
-  const journal = isQuiet ? null : createJournal(cwd);
+  const journal = createJournal(cwd, { onActualWritesChanged: (info) => turnStop.onActualWritesChanged(info) });
 
   let result;
+  let textTail = "";
   try {
     result = await runTurnFn({
       cli,
@@ -950,11 +1144,16 @@ async function handleReview(argv, deps, log, logError) {
       model,
       mode,
       timeoutMs,
+      signal: turnStop.signal,
       onProgress: makeOnProgress(logError, {
         quiet: Boolean(options.quiet),
         noStream: Boolean(options["no-stream"]),
         cwd,
         journal,
+        onTextDelta: (delta) => {
+          textTail = appendTextTail(textTail, delta);
+        },
+        onToolCall: () => turnStop.onToolCall(),
       }),
       // Same reasoning as `handleCode` above: `runTurn`'s default is "deny",
       // and `review` opts into "allow" too. A review needs to actually use
@@ -967,10 +1166,30 @@ async function handleReview(argv, deps, log, logError) {
   } catch (err) {
     // Requirement 3 & 7: best-effort summary on failure (never changes exit
     // code), then re-throw so runCli() sets the right exit code.
+    if (isRunTurnTimeout(err)) turnStop.stopForTimeout(timeoutMs);
+    const stopReason = turnStop.reason;
+    turnStop.dispose();
+    if (stopReason) {
+      const writeInfo = journal.getActualWriteInfo();
+      logError(renderStoppedTurnReason(stopReason, { toolCallCount: turnStop.toolCallCount, lastWriteAt: writeInfo.lastWriteAt }));
+      printInterruptedResponse(log, textTail);
+      if (!isQuiet) printChangesSummary(gitSnapshot, cwd, journal, logError, diffSnapshots, renderSummary);
+      return stoppedExitCode(journal);
+    }
     if (!isQuiet) {
       printChangesSummary(gitSnapshot, cwd, journal, logError, diffSnapshots, renderSummary);
     }
     throw isRunTurnTimeout(err) ? toActionableTimeoutError(err, timeoutMs) : err;
+  }
+
+  const stopReason = turnStop.reason;
+  turnStop.dispose();
+  if (stopReason) {
+    const writeInfo = journal.getActualWriteInfo();
+    logError(renderStoppedTurnReason(stopReason, { toolCallCount: turnStop.toolCallCount, lastWriteAt: writeInfo.lastWriteAt }));
+    printInterruptedResponse(log, textTail);
+    if (!isQuiet) printChangesSummary(gitSnapshot, cwd, journal, logError, diffSnapshots, renderSummary);
+    return stoppedExitCode(journal);
   }
 
   log((typeof result.response === "string" ? result.response : JSON.stringify(result.response, null, 2)) + "\n");

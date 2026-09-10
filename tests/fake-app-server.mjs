@@ -65,6 +65,7 @@ let nextServerRequestId = 1;
 // from this extension.
 //
 // Recognized scenarios: success, failure, no-providers, timeout, stop,
+// write-stop, no-write-stop, many-tools-stop, denied-write-idle,
 // usage-fail, permission, permission-write, permission-edit, user-input (see scheduleTurnEvents, the
 // `session/send` case's own `interaction/*` branches, and the session/usage
 // case below), plus four heartbeat-specific scenarios (see both places
@@ -203,6 +204,48 @@ function scheduleTurnEvents(sessionId, scenario, getScopesSeen) {
         }),
       10,
     );
+    return;
+  }
+
+  if (scenario === "write-stop" || scenario === "no-write-stop" || scenario === "many-tools-stop") {
+    setTimeout(
+      () =>
+        emitEvent(sessionId, "model.streaming", {
+          assistantMessageId: "m1",
+          delta: "internal reasoning",
+          done: false,
+          kind: "reasoning_delta",
+        }),
+      5,
+    );
+    setTimeout(
+      () =>
+        emitEvent(sessionId, "model.streaming", {
+          assistantMessageId: "m1",
+          delta: "unfinished visible response",
+          done: false,
+          kind: "text_delta",
+        }),
+      10,
+    );
+    if (scenario !== "no-write-stop") {
+      const calls = scenario === "many-tools-stop" ? 3 : 1;
+      for (let index = 0; index < calls; index += 1) {
+        setTimeout(
+          () =>
+            emitEvent(sessionId, "model.streaming", {
+              assistantMessageId: "m1",
+              delta: "",
+              done: false,
+              kind: "tool_call",
+              toolCallId: `stop-call-${index + 1}`,
+              toolName: index === 0 ? "Write" : "Read",
+              input: index === 0 ? { file_path: "src/written.mjs", content: "x" } : { file_path: "README.md" },
+            }),
+          15 + index * 5,
+        );
+      }
+    }
     return;
   }
 
@@ -746,6 +789,62 @@ rl.on("line", (line) => {
               });
             },
           );
+        } else if (scenario === "denied-write-idle") {
+          // A model tool_call precedes the permission request on the wire.
+          // Keep the terminal response past the companion's short idle limit:
+          // a denied call must clear its tentative write timestamp, rather
+          // than stopping this otherwise successful turn.
+          setTimeout(
+            () =>
+              emitEvent(sessionId, "model.streaming", {
+                assistantMessageId: "m1",
+                delta: "",
+                done: false,
+                kind: "tool_call",
+                toolCallId: "denied-idle-write",
+                toolName: "Write",
+                input: { file_path: "docs/outside.txt", content: "x" },
+              }),
+            5,
+          );
+          setTimeout(
+            () =>
+              sendServerRequest(
+                "interaction/requestPermission",
+                {
+                  toolName: "Write",
+                  toolCallId: "denied-idle-write",
+                  input: { file_path: "docs/outside.txt", content: "x" },
+                },
+                () => {
+                  setTimeout(
+                    () =>
+                      emitEvent(sessionId, "turn.completed", {
+                        response: "write was denied",
+                        usage: {
+                          source: "provider",
+                          modelRequestCount: 1,
+                          inputTokens: 10,
+                          outputTokens: 5,
+                          totalTokens: 15,
+                          cacheReadTokens: 0,
+                          cacheWriteTokens: 0,
+                          reasoningTokens: 0,
+                          webFetchRequests: 0,
+                          webSearchRequests: 0,
+                        },
+                        toolCallCount: 1,
+                        historyRoundCount: 1,
+                        duration: 100,
+                        resultType: "completed",
+                        cacheStats: {},
+                      }),
+                    100,
+                  );
+                },
+              ),
+            10,
+          );
         } else if (scenario === "user-input") {
           sendServerRequest(
             "interaction/requestUserInput",
@@ -785,7 +884,13 @@ rl.on("line", (line) => {
       const sessionId = params?.sessionId;
       send({ id, result: { stopped: true } });
       const scenario = sessionScenarios.get(sessionId);
-      if (scenario === "stop") {
+      if (
+        scenario === "stop" ||
+        scenario === "write-stop" ||
+        scenario === "no-write-stop" ||
+        scenario === "many-tools-stop" ||
+        scenario === "denied-write-idle"
+      ) {
         // Only session/stop ever produces a terminal event for this
         // scenario — simulates a turn that hangs until explicitly cancelled.
         setTimeout(

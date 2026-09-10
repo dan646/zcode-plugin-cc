@@ -838,6 +838,19 @@ export async function runTurn({
       }
 
       if (outcome.type === "timeout") {
+        // A wall-clock timeout is also an explicit stop, not merely a local
+        // decision to stop waiting. Tell the app-server before closing the
+        // session so it does not keep an orphaned turn alive until its own
+        // TTL. This mirrors the AbortSignal cancellation path above; unlike
+        // it, the caller still receives the timeout error and can classify
+        // the stop reason separately.
+        try {
+          await client.call("session/stop", { sessionId });
+        } catch {
+          // Best-effort — the timeout remains the primary outcome even if
+          // the server is already unavailable.
+        }
+
         throw new Error(
           `ZCode turn timed out after ${timeoutMs}ms waiting for turn.completed/turn.failed ` +
             `(sessionId=${sessionId}).`,

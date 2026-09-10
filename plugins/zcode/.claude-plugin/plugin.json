@@ -1,6 +1,6 @@
 {
   "name": "zcode",
-  "version": "0.4.1",
+  "version": "0.5.0",
   "description": "Use ZCode (GLM) from Claude Code to write and review code.",
   "author": {
     "name": "daniarergaliev"
